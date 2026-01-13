@@ -134,7 +134,7 @@ def analyze_market():
     ema50 = calculate_ema(closes, 50)
     atr = calculate_atr(highs, lows, closes)
 
-    if rsi >= 70 and price < ema20 and price < ema50:
+    if rsi >= 40 and price < ema20 and price < ema50:
         sl = round(price + atr * 1.5, 2)
         tp = round(price - atr * 2.5, 2)
         return ("SELL", price, tp, sl, rsi, ema20, ema50, atr)
@@ -269,3 +269,4 @@ Thread(target=trade_monitor_loop).start()
 Thread(target=auto_signal_loop).start()
 print("🤖 Bot running with AUTO TP/SL closing")
 bot.polling(none_stop=True)
+
