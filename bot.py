@@ -3,8 +3,14 @@ import time
 import csv
 import requests
 import telebot
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Thread
+
+# =========================
+# TIMEZONE (ALGERIA UTC+1)
+# =========================
+def dz_now():
+    return datetime.utcnow() + timedelta(hours=1)
 
 # =========================
 # CONFIG
@@ -26,46 +32,29 @@ BREAKOUT_WEIGHT = 30
 
 MIN_ATR = 1.5
 
+# Counters
+CANDLES_WITHOUT_TRADE = 0
+NEAR_TRADES_COUNT = 0
+ANALYZED_CANDLES = 0
+
+LAST_DAILY_REPORT_DATE = None
+
 # =========================
 # ENV VARIABLES
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-METALS_API_KEY = os.getenv("METALS_API_KEY")
 TD_API_KEY = os.getenv("TD_API_KEY")
 
-if not BOT_TOKEN or not METALS_API_KEY or not TD_API_KEY:
+if not BOT_TOKEN or not TD_API_KEY:
     raise Exception("❌ Missing Environment Variables")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
 SUBSCRIBERS = set()
 OPEN_TRADE = None
-TRADES_FILE = "trades.csv"
-
-# =========================
-# INIT CSV
-# =========================
-if not os.path.exists(TRADES_FILE):
-    with open(TRADES_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["time", "pair", "direction", "entry", "tp", "sl", "result"])
 
 # =========================
 # HELPERS
 # =========================
-def save_trade(direction, entry, tp, sl, result="OPEN"):
-    with open(TRADES_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-            PAIR,
-            direction,
-            entry,
-            tp,
-            sl,
-            result
-        ])
-
 def get_candles(limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
@@ -115,11 +104,10 @@ def atr(highs, lows, closes, period=14):
 # ANALYSIS
 # =========================
 def analyze_market():
-    reasons = []
-    candles = get_candles()
+    global CANDLES_WITHOUT_TRADE, NEAR_TRADES_COUNT, ANALYZED_CANDLES
 
-    if len(candles) < 100:
-        return ["بيانات غير كافية"]
+    ANALYZED_CANDLES += 1
+    candles = get_candles()
 
     closes = [float(c["close"]) for c in candles]
     highs = [float(c["high"]) for c in candles]
@@ -141,8 +129,6 @@ def analyze_market():
     elif r >= RSI_SELL:
         confidence += 25
         direction = "SELL"
-    else:
-        reasons.append(f"RSI ({r:.2f}) حيادي")
 
     # EMA
     if price > e20 and price > e50:
@@ -151,45 +137,42 @@ def analyze_market():
     elif price < e20 and price < e50:
         confidence += 20
         direction = "SELL"
-    else:
-        reasons.append("السعر بين EMA20 و EMA50")
 
     # ATR
     if a >= MIN_ATR:
         confidence += 15
-    else:
-        reasons.append(f"ATR ضعيف ({a:.2f})")
 
-    # BREAKOUT
+    # Breakout
     recent_high = max(highs[-BREAKOUT_LOOKBACK:])
     recent_low = min(lows[-BREAKOUT_LOOKBACK:])
 
-    breakout = False
     if price > recent_high + BREAKOUT_BUFFER:
         confidence += BREAKOUT_WEIGHT
         direction = "BUY"
-        breakout = True
     elif price < recent_low - BREAKOUT_BUFFER:
         confidence += BREAKOUT_WEIGHT
         direction = "SELL"
-        breakout = True
-    else:
-        reasons.append("لا يوجد Breakout")
 
-    # NEAR TRADE
+    # Momentum Alert
+    if abs(r - rsi(closes[:-1])) >= 5:
+        for uid in SUBSCRIBERS:
+            bot.send_message(
+                uid,
+                f"⚡ بداية زخم – XAUUSD M15\nRSI يتحرّك بقوة ({r:.2f})"
+            )
+
+    # Near Trade
     if NEAR_CONFIDENCE <= confidence < MIN_CONFIDENCE:
-        return {
-            "near": True,
-            "price": price,
-            "rsi": r,
-            "confidence": confidence,
-            "breakout": breakout
-        }
+        NEAR_TRADES_COUNT += 1
+        return "NEAR"
 
+    # No Trade
     if confidence < MIN_CONFIDENCE or not direction:
-        reasons.append(f"Confidence منخفض ({confidence}%)")
-        return reasons
+        CANDLES_WITHOUT_TRADE += 1
+        return None
 
+    # Trade
+    CANDLES_WITHOUT_TRADE = 0
     return {
         "direction": direction,
         "price": price,
@@ -198,65 +181,66 @@ def analyze_market():
     }
 
 # =========================
+# DAILY REPORT
+# =========================
+def send_daily_report():
+    global LAST_DAILY_REPORT_DATE, ANALYZED_CANDLES, NEAR_TRADES_COUNT, CANDLES_WITHOUT_TRADE
+
+    today = dz_now().date()
+    if LAST_DAILY_REPORT_DATE == today:
+        return
+
+    if dz_now().hour == 23:
+        for uid in SUBSCRIBERS:
+            bot.send_message(
+                uid,
+                f"""
+📊 التقرير اليومي – XAUUSD (M15)
+
+🔍 الشموع المحللة: {ANALYZED_CANDLES}
+⚠️ Near Trades: {NEAR_TRADES_COUNT}
+⏳ شمعات بدون صفقة: {CANDLES_WITHOUT_TRADE}
+
+🕒 التوقيت: الجزائر 🇩🇿
+"""
+            )
+
+        LAST_DAILY_REPORT_DATE = today
+        ANALYZED_CANDLES = 0
+        NEAR_TRADES_COUNT = 0
+
+# =========================
 # AUTO LOOP
 # =========================
 def auto_loop():
-    global OPEN_TRADE
     while True:
         try:
-            if OPEN_TRADE is None:
-                result = analyze_market()
+            result = analyze_market()
 
-                if isinstance(result, list):
-                    if DEBUG:
-                        for uid in SUBSCRIBERS:
-                            bot.send_message(
-                                uid,
-                                "🧪 DEBUG MODE\n" +
-                                "\n".join(f"❌ {r}" for r in result)
-                            )
-
-                elif isinstance(result, dict) and result.get("near"):
-                    for uid in SUBSCRIBERS:
-                        bot.send_message(
-                            uid,
-                            f"""
-⚠️ قرب صفقة – XAUUSD M15
-RSI: {result['rsi']:.2f}
-Confidence: {result['confidence']}%
-Breakout: {'نعم' if result['breakout'] else 'قريب'}
-👀 راقب الشمعة القادمة
-"""
-                        )
-
-                else:
-                    direction = result["direction"]
-                    price = result["price"]
-                    a = result["atr"]
-
-                    tp = price + a * 2.5 if direction == "BUY" else price - a * 2.5
-                    sl = price - a * 1.5 if direction == "BUY" else price + a * 1.5
-
-                    save_trade(direction, price, tp, sl)
-
-                    for uid in SUBSCRIBERS:
-                        bot.send_message(
-                            uid,
-                            f"""
+            if isinstance(result, dict):
+                for uid in SUBSCRIBERS:
+                    bot.send_message(
+                        uid,
+                        f"""
 📊 XAUUSD – M15
-{'🟢 BUY' if direction=='BUY' else '🔴 SELL'} @ {price:.2f}
-🎯 TP: {tp:.2f}
-❌ SL: {sl:.2f}
-🧠 Confidence: {result['confidence']}%
+{'🟢 BUY' if result['direction']=='BUY' else '🔴 SELL'}
+Price: {result['price']:.2f}
+Confidence: {result['confidence']}%
 """
-                        )
+                    )
 
-                    OPEN_TRADE = True
+            if CANDLES_WITHOUT_TRADE % 8 == 0 and CANDLES_WITHOUT_TRADE != 0:
+                for uid in SUBSCRIBERS:
+                    bot.send_message(
+                        uid,
+                        f"⏳ لا توجد صفقات منذ {CANDLES_WITHOUT_TRADE} شمعات M15"
+                    )
+
+            send_daily_report()
 
         except Exception as e:
             print("ERROR:", e)
 
-        # NON BLOCKING WAIT
         for _ in range(CHECK_EVERY):
             time.sleep(1)
 
@@ -268,35 +252,11 @@ def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 DEBUG + Breakout Filter مفعل"
-    )
-
-@bot.message_handler(commands=["force"])
-def force_trade(message):
-    price = 2400.0  # سعر وهمي للاختبار فقط
-    atr_val = 5.0
-
-    tp = price - atr_val * 2.5
-    sl = price + atr_val * 1.5
-
-    save_trade("SELL", price, tp, sl)
-
-    bot.send_message(
-        message.chat.id,
-        f"""
-🧪 FORCED TRADE (TEST)
-
-XAUUSD – M15
-🔴 SELL @ {price:.2f}
-🎯 TP: {tp:.2f}
-❌ SL: {sl:.2f}
-🧠 Confidence: 100%
-"""
+        "🤖 البوت يعمل\n📍 توقيت الجزائر\n🧠 شفافية كاملة مفعّلة"
     )
 
 # =========================
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED – M15 (FINAL STABLE MODE)")
 bot.infinity_polling()
