@@ -1,13 +1,25 @@
 import os
 import time
-import csv
 import requests
 import telebot
-from threading import Thread
 from datetime import datetime
+from threading import Thread
 
 # =========================
-# Environment Variables
+# CONFIG
+# =========================
+DEBUG = True
+PAIR = "XAUUSD"
+INTERVAL = "5min"
+CHECK_EVERY = 300  # 5 minutes
+
+MIN_CONFIDENCE = 70
+RSI_BUY = 30
+RSI_SELL = 70
+MIN_ATR = 1.5
+
+# =========================
+# ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 METALS_API_KEY = os.getenv("METALS_API_KEY")
@@ -18,255 +30,192 @@ if not BOT_TOKEN or not METALS_API_KEY or not TD_API_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# =========================
-# Files & State
-# =========================
-TRADES_FILE = "trades.csv"
 SUBSCRIBERS = set()
-OPEN_TRADE = None  # {direction, entry, tp, sl, time}
+OPEN_TRADE = None
 
 # =========================
-# Ensure CSV Exists
+# HELPERS
 # =========================
-if not os.path.exists(TRADES_FILE):
-    with open(TRADES_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["time", "pair", "direction", "entry", "tp", "sl", "result"])
-
-# =========================
-# Utils
-# =========================
-def save_trade(direction, entry, tp, sl, result):
-    with open(TRADES_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-            "XAUUSD",
-            direction,
-            entry,
-            tp,
-            sl,
-            result
-        ])
-
-def get_stats():
-    total = wins = losses = 0
-    with open(TRADES_FILE, "r") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            total += 1
-            if r["result"] == "WIN":
-                wins += 1
-            if r["result"] == "LOSS":
-                losses += 1
-    winrate = round((wins / total) * 100, 2) if total else 0
-    return total, wins, losses, winrate
-
-# =========================
-# Market Data
-# =========================
-def get_xauusd_price():
+def get_price():
     r = requests.get(
-        "https://metals-api.com/api/latest",
-        params={"access_key": METALS_API_KEY, "base": "USD", "symbols": "XAU"},
-        timeout=10
+        "https://api.metals.dev/v1/latest",
+        params={"api_key": METALS_API_KEY, "symbols": "XAU"}
     )
-    return round(1 / r.json()["rates"]["XAU"], 2)
+    return float(r.json()["rates"]["XAU"])
 
-def get_ohlc(limit=120):
+def get_candles(limit=100):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
             "symbol": "XAU/USD",
-            "interval": "5min",
+            "interval": INTERVAL,
             "outputsize": limit,
             "apikey": TD_API_KEY
-        },
-        timeout=10
+        }
     )
-    values = r.json()["values"]
-    values.reverse()
-    highs = [float(v["high"]) for v in values]
-    lows = [float(v["low"]) for v in values]
-    closes = [float(v["close"]) for v in values]
-    return highs, lows, closes
+    data = r.json().get("values", [])
+    data.reverse()
+    return data
 
-# =========================
-# Indicators
-# =========================
-def calculate_rsi(closes, period=14):
+def ema(values, period):
+    k = 2 / (period + 1)
+    ema_val = sum(values[:period]) / period
+    for v in values[period:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
+
+def rsi(values, period=14):
     gains, losses = [], []
     for i in range(1, period + 1):
-        diff = closes[-i] - closes[-i - 1]
-        (gains if diff >= 0 else losses).append(abs(diff))
+        diff = values[-i] - values[-i - 1]
+        if diff >= 0:
+            gains.append(diff)
+        else:
+            losses.append(abs(diff))
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period if losses else 0.0001
     rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
+    return 100 - (100 / (1 + rs))
 
-def calculate_ema(closes, period):
-    k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-    return round(ema, 2)
-
-def calculate_atr(highs, lows, closes, period=14):
+def atr(highs, lows, closes, period=14):
     trs = []
     for i in range(1, period + 1):
-        tr = max(
+        trs.append(max(
             highs[-i] - lows[-i],
             abs(highs[-i] - closes[-i - 1]),
             abs(lows[-i] - closes[-i - 1])
-        )
-        trs.append(tr)
-    return round(sum(trs) / period, 2)
+        ))
+    return sum(trs) / period
 
 # =========================
-# Strategy (RSI + EMA + ATR)
+# ANALYSIS
 # =========================
 def analyze_market():
-    highs, lows, closes = get_ohlc()
-    price = get_xauusd_price()
+    reasons = []
 
-    rsi = calculate_rsi(closes)
-    ema20 = calculate_ema(closes, 20)
-    ema50 = calculate_ema(closes, 50)
-    atr = calculate_atr(highs, lows, closes)
+    candles = get_candles()
+    if len(candles) < 60:
+        reasons.append("بيانات غير كافية")
+        return reasons
 
-    if rsi >= 40 and price < ema20 and price < ema50:
-        sl = round(price + atr * 1.5, 2)
-        tp = round(price - atr * 2.5, 2)
-        return ("SELL", price, tp, sl, rsi, ema20, ema50, atr)
+    closes = [float(c["close"]) for c in candles]
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
 
-    if rsi <= 30 and price > ema20 and price > ema50:
-        sl = round(price - atr * 1.5, 2)
-        tp = round(price + atr * 2.5, 2)
-        return ("BUY", price, tp, sl, rsi, ema20, ema50, atr)
+    price = closes[-1]
+    r = rsi(closes)
+    e20 = ema(closes[-40:], 20)
+    e50 = ema(closes[-80:], 50)
+    a = atr(highs, lows, closes)
 
-    return None
+    confidence = 0
 
-# =========================
-# Open Trade
-# =========================
-def open_trade(signal):
-    global OPEN_TRADE
-    direction, entry, tp, sl, rsi, ema20, ema50, atr = signal
-    OPEN_TRADE = {
-        "direction": direction,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "time": datetime.utcnow()
+    # RSI
+    if r <= RSI_BUY or r >= RSI_SELL:
+        confidence += 30
+    else:
+        reasons.append(f"RSI غير مناسب ({r:.2f})")
+
+    # EMA Trend
+    if price > e20 and price > e50:
+        trend = "BUY"
+        confidence += 25
+    elif price < e20 and price < e50:
+        trend = "SELL"
+        confidence += 25
+    else:
+        trend = None
+        reasons.append("السعر بين EMA20 و EMA50")
+
+    # ATR
+    if a >= MIN_ATR:
+        confidence += 20
+    else:
+        reasons.append(f"ATR ضعيف ({a:.2f})")
+
+    # Final decision
+    if confidence < MIN_CONFIDENCE:
+        reasons.append(f"Confidence منخفض ({confidence}%)")
+
+    if reasons:
+        return reasons
+
+    return {
+        "direction": trend,
+        "price": price,
+        "atr": a,
+        "confidence": confidence
     }
-    for cid in SUBSCRIBERS:
-        bot.send_message(
-            cid,
-            f"""
-📊 XAUUSD – M5
-{'🔴 SELL' if direction=='SELL' else '🟢 BUY'} @ {entry}
-
-RSI: {rsi}
-EMA20: {ema20}
-EMA50: {ema50}
-ATR: {atr}
-
-🎯 TP: {tp}
-❌ SL: {sl}
-"""
-        )
 
 # =========================
-# Monitor Open Trade (TP/SL)
+# LOOP
 # =========================
-def trade_monitor_loop():
+def auto_loop():
     global OPEN_TRADE
+
     while True:
         try:
-            if OPEN_TRADE:
-                price = get_xauusd_price()
-                d = OPEN_TRADE["direction"]
-                tp = OPEN_TRADE["tp"]
-                sl = OPEN_TRADE["sl"]
-                entry = OPEN_TRADE["entry"]
+            print("🔍 Checking market", datetime.utcnow())
 
-                if d == "BUY" and price >= tp:
-                    save_trade("BUY", entry, tp, sl, "WIN")
-                    for cid in SUBSCRIBERS:
-                        bot.send_message(cid, f"✅ TP HIT @ {price} — WIN")
-                    OPEN_TRADE = None
-
-                elif d == "BUY" and price <= sl:
-                    save_trade("BUY", entry, tp, sl, "LOSS")
-                    for cid in SUBSCRIBERS:
-                        bot.send_message(cid, f"❌ SL HIT @ {price} — LOSS")
-                    OPEN_TRADE = None
-
-                elif d == "SELL" and price <= tp:
-                    save_trade("SELL", entry, tp, sl, "WIN")
-                    for cid in SUBSCRIBERS:
-                        bot.send_message(cid, f"✅ TP HIT @ {price} — WIN")
-                    OPEN_TRADE = None
-
-                elif d == "SELL" and price >= sl:
-                    save_trade("SELL", entry, tp, sl, "LOSS")
-                    for cid in SUBSCRIBERS:
-                        bot.send_message(cid, f"❌ SL HIT @ {price} — LOSS")
-                    OPEN_TRADE = None
-
-        except Exception:
-            pass
-
-        time.sleep(60)  # فحص كل دقيقة
-
-# =========================
-# Auto Signal Loop (كل 5 دقائق)
-# =========================
-def auto_signal_loop():
-    while True:
-        try:
             if OPEN_TRADE is None:
-                signal = analyze_market()
-                if signal:
-                    open_trade(signal)
-        except Exception:
-            pass
-        time.sleep(300)
+                result = analyze_market()
+
+                if isinstance(result, list):
+                    if DEBUG:
+                        for uid in SUBSCRIBERS:
+                            bot.send_message(
+                                uid,
+                                "🧪 DEBUG MODE\n" +
+                                "\n".join(f"❌ {r}" for r in result)
+                            )
+                else:
+                    direction = result["direction"]
+                    price = result["price"]
+                    atr_val = result["atr"]
+
+                    tp = price + atr_val * 2.5 if direction == "BUY" else price - atr_val * 2.5
+                    sl = price - atr_val * 1.5 if direction == "BUY" else price + atr_val * 1.5
+
+                    for uid in SUBSCRIBERS:
+                        bot.send_message(
+                            uid,
+                            f"""
+📊 XAUUSD – M5
+{'🟢 BUY' if direction=='BUY' else '🔴 SELL'} @ {price:.2f}
+🎯 TP: {tp:.2f}
+❌ SL: {sl:.2f}
+🧠 Confidence: {result['confidence']}%
+"""
+                        )
+
+                    OPEN_TRADE = True
+
+        except Exception as e:
+            print("ERROR:", e)
+
+        time.sleep(CHECK_EVERY)
 
 # =========================
-# Commands
+# COMMANDS
 # =========================
 @bot.message_handler(commands=["start"])
 def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 البوت يعمل\n"
-        "📈 إشارات تلقائية\n"
-        "🎯 إغلاق تلقائي عند TP/SL\n"
-        "/stats ➜ إحصائيات الأداء"
+        "🤖 البوت يعمل\n⏱️ فحص كل 5 دقائق\n🧪 DEBUG MODE مفعل"
     )
 
-@bot.message_handler(commands=["stats"])
-def stats(message):
-    total, wins, losses, winrate = get_stats()
+@bot.message_handler(commands=["force"])
+def force(message):
     bot.send_message(
         message.chat.id,
-        f"""
-📊 إحصائيات XAUUSD
-
-Total Trades: {total}
-Wins: {wins}
-Losses: {losses}
-Win Rate: {winrate}%
-"""
+        "🧪 FORCED TRADE TEST\nSELL XAUUSD @ السعر الحالي"
     )
 
 # =========================
-# Run
+# START
 # =========================
-Thread(target=trade_monitor_loop).start()
-Thread(target=auto_signal_loop).start()
-print("🤖 Bot running with AUTO TP/SL closing")
-bot.polling(none_stop=True)
-
+Thread(target=auto_loop, daemon=True).start()
+print("🤖 BOT STARTED WITH DEBUG MODE")
+bot.infinity_polling()
