@@ -14,25 +14,24 @@ def dz_now():
 PAIR = "XAU/USD"
 LOT_SIZE = 0.02
 
-# === INTERVALS ===
 ICT_INTERVAL = "15min"
 FAST_INTERVAL = "5min"
 
 CHECK_EVERY = 300  # 5 minutes
 
-# === ICT SETTINGS ===
-ICT_LOOKBACK = 20
-TP_ICT_ATR = 1.8
-SL_ICT_ATR = 1.2
-MIN_CONF_ICT = 70
+# === Risk & Confidence ===
+MIN_CONF_ICT = 80
+MIN_CONF_EMA = 80
+MIN_CONF_SCALP = 80
 
-# === EMA / SCALP SETTINGS ===
+NEAR_TRADE_MIN = 60
+NEAR_TRADE_MAX = 79
+
 TP_FAST_ATR = 0.6
 SL_FAST_ATR = 0.8
-MIN_CONF_EMA = 60
-MIN_CONF_SCALP = 55
+TP_ICT_ATR = 1.8
+SL_ICT_ATR = 1.2
 
-# === DIRECTION COOLDOWN ===
 DIRECTION_COOLDOWN = 60  # minutes
 
 # =========================
@@ -51,9 +50,10 @@ SUBSCRIBERS = set()
 # =========================
 LAST_TRADE_DIR = None
 LAST_TRADE_TIME = None
+LAST_NEAR_ALERT = None
 
 # =========================
-# DATA FUNCTIONS
+# DATA
 # =========================
 def get_candles(interval, limit=200):
     r = requests.get(
@@ -93,26 +93,47 @@ def atr(h,l,c,p=14):
     return sum(t)/p
 
 # =========================
-# DIRECTION FILTER
+# HELPERS
 # =========================
 def direction_allowed(direction):
     global LAST_TRADE_DIR, LAST_TRADE_TIME
-
     if LAST_TRADE_DIR is None:
         return True
-
     if direction != LAST_TRADE_DIR:
         return True
-
-    elapsed = (dz_now() - LAST_TRADE_TIME).total_seconds() / 60
+    elapsed = (dz_now() - LAST_TRADE_TIME).total_seconds()/60
     return elapsed >= DIRECTION_COOLDOWN
 
+def in_killzone():
+    h = dz_now().hour
+    return (9 <= h <= 11) or (15 <= h <= 18)
+
+def send_near_trade(price, score, direction, tf):
+    global LAST_NEAR_ALERT
+    if LAST_NEAR_ALERT == score:
+        return
+    LAST_NEAR_ALERT = score
+
+    zone = f"{round(price-2,2)} – {round(price+2,2)}"
+    msg = f"""
+🚨 Near Trade Alert – XAUUSD ({tf})
+
+📍 المنطقة: {zone}
+📊 الاتجاه: {direction}
+⏳ قربنا من صفقة: {score}%
+🕯️ متوقّع خلال: 1–2 شمعة
+
+⚠️ تنبيه فقط – لا دخول بعد
+"""
+    for u in SUBSCRIBERS:
+        bot.send_message(u, msg)
+
 # =========================
-# ICT STRATEGY (STRONG)
+# STRATEGIES
 # =========================
-def ict_strategy():
-    cs = get_candles(ICT_INTERVAL)
-    if len(cs) < 100:
+def analyze(interval, mode):
+    cs = get_candles(interval)
+    if len(cs) < 60:
         return None
 
     c = [float(x["close"]) for x in cs]
@@ -122,119 +143,61 @@ def ict_strategy():
     price = c[-1]
     e20 = ema(c[-40:],20)
     e50 = ema(c[-80:],50)
+    r = rsi(c)
+    a = atr(h,l,c)
 
+    score = 0
     direction = None
-    conf = 40
 
+    if in_killzone():
+        score += 20
     if price > e20 and price > e50:
         direction = "BUY"
+        score += 20
     elif price < e20 and price < e50:
         direction = "SELL"
+        score += 20
     else:
         return None
 
-    ph = max(h[-ICT_LOOKBACK:-1])
-    pl = min(l[-ICT_LOOKBACK:-1])
+    if 40 <= r <= 60:
+        score += 15
+    if abs(price - max(h[-20:])) < 2 or abs(price - min(l[-20:])) < 2:
+        score += 15
+    if abs(c[-1]-c[-2]) > a*0.3:
+        score += 10
 
-    if direction == "SELL" and h[-1] > ph and c[-1] < ph:
-        conf += 30
-    elif direction == "BUY" and l[-1] < pl and c[-1] > pl:
-        conf += 30
-    else:
+    # Near Trade
+    if NEAR_TRADE_MIN <= score <= NEAR_TRADE_MAX:
+        send_near_trade(price, score, direction, interval)
         return None
 
-    if conf < MIN_CONF_ICT:
-        return None
+    # Real trade
+    if score >= 80 and direction_allowed(direction):
+        tp = price + a*(TP_ICT_ATR if interval==ICT_INTERVAL else TP_FAST_ATR) if direction=="BUY" else price - a*(TP_ICT_ATR if interval==ICT_INTERVAL else TP_FAST_ATR)
+        sl = price - a*(SL_ICT_ATR if interval==ICT_INTERVAL else SL_FAST_ATR) if direction=="BUY" else price + a*(SL_ICT_ATR if interval==ICT_INTERVAL else SL_FAST_ATR)
 
-    a = atr(h,l,c)
-    tp = price + a*TP_ICT_ATR if direction=="BUY" else price - a*TP_ICT_ATR
-    sl = price - a*SL_ICT_ATR if direction=="BUY" else price + a*SL_ICT_ATR
+        return mode, direction, price, tp, sl, score
 
-    return ("🟢 صفقة قوية (ICT – M15)", direction, price, tp, sl, conf)
-
-# =========================
-# EMA STRATEGY (MEDIUM)
-# =========================
-def ema_strategy():
-    cs = get_candles(FAST_INTERVAL)
-    if len(cs) < 60:
-        return None
-
-    c = [float(x["close"]) for x in cs]
-    h = [float(x["high"]) for x in cs]
-    l = [float(x["low"]) for x in cs]
-
-    price = c[-1]
-    e20 = ema(c[-30:],20)
-    e50 = ema(c[-50:],50)
-    r = rsi(c)
-
-    direction = None
-    conf = 40
-
-    if price > e50 and price <= e20 and r < 55:
-        direction = "BUY"
-        conf += 20
-    elif price < e50 and price >= e20 and r > 45:
-        direction = "SELL"
-        conf += 20
-    else:
-        return None
-
-    if conf < MIN_CONF_EMA:
-        return None
-
-    a = atr(h,l,c)
-    tp = price + a*TP_FAST_ATR if direction=="BUY" else price - a*TP_FAST_ATR
-    sl = price - a*SL_FAST_ATR if direction=="BUY" else price + a*SL_FAST_ATR
-
-    return ("🟡 صفقة متوسطة (EMA – M5)", direction, price, tp, sl, conf)
-
-# =========================
-# SCALPING STRATEGY (HIGH RISK)
-# =========================
-def scalp_strategy():
-    cs = get_candles(FAST_INTERVAL)
-    if len(cs) < 40:
-        return None
-
-    c = [float(x["close"]) for x in cs]
-    h = [float(x["high"]) for x in cs]
-    l = [float(x["low"]) for x in cs]
-
-    price = c[-1]
-    r = rsi(c)
-
-    if r < 30:
-        direction = "BUY"
-    elif r > 70:
-        direction = "SELL"
-    else:
-        return None
-
-    conf = 55
-    a = atr(h,l,c)
-    tp = price + a*0.4 if direction=="BUY" else price - a*0.4
-    sl = price - a*0.6 if direction=="BUY" else price + a*0.6
-
-    return ("🔴 صفقة مخاطرة عالية (Scalping – M5)", direction, price, tp, sl, conf)
+    return None
 
 # =========================
 # MAIN LOOP
 # =========================
 def loop():
     global LAST_TRADE_DIR, LAST_TRADE_TIME
-
     while True:
         try:
-            for strat in [ict_strategy, ema_strategy, scalp_strategy]:
-                res = strat()
+            checks = [
+                (ICT_INTERVAL, "🟢 صفقة قوية (ICT – M15)"),
+                (FAST_INTERVAL, "🟡 صفقة متوسطة (EMA – M5)"),
+                (FAST_INTERVAL, "🔴 صفقة مخاطرة عالية (Scalping – M5)")
+            ]
+
+            for tf, label in checks:
+                res = analyze(tf, label)
                 if res:
                     title, direction, price, tp, sl, conf = res
-
-                    if not direction_allowed(direction):
-                        continue
-
                     for u in SUBSCRIBERS:
                         bot.send_message(
                             u,
@@ -247,10 +210,9 @@ TP: {tp:.2f}
 SL: {sl:.2f}
 🧠 Confidence: {conf}%"""
                         )
-
                     LAST_TRADE_DIR = direction
                     LAST_TRADE_TIME = dz_now()
-                    time.sleep(60)  # anti-spam
+                    time.sleep(60)
         except Exception as e:
             print("ERROR:", e)
 
@@ -264,10 +226,9 @@ def start(m):
     SUBSCRIBERS.add(m.chat.id)
     bot.send_message(
         m.chat.id,
-        "🤖 البوت يعمل\n"
-        "🟢 ICT (قوية)\n"
-        "🟡 EMA (متوسطة)\n"
-        "🔴 Scalping (مخاطرة)\n"
+        "🤖 النظام شبه الاحترافي يعمل\n"
+        "🚨 Near Trade مفعّل\n"
+        "🟢 قوية / 🟡 متوسطة / 🔴 مخاطرة\n"
         "⏱️ منع الاتجاه: 60 دقيقة"
     )
 
