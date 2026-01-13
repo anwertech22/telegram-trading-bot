@@ -14,7 +14,7 @@ def dz_now():
 DEBUG = True
 PAIR = "XAUUSD"
 INTERVAL = "15min"
-CHECK_EVERY = 900  # 15 minutes
+CHECK_EVERY = 900
 
 RSI_BUY = 40
 RSI_SELL = 60
@@ -28,9 +28,9 @@ ICT_LOOKBACK = 20
 R_TP = 2.5
 R_SL = 1.5
 
-# Sessions (Algeria)
-LONDON = (9, 12)
-NEWYORK = (15, 18)
+# 🔥 Killzones الدقيقة (الجزائر)
+LONDON_KZ = (9, 10, 30)    # 09:00 → 10:30
+NY_KZ = (15, 30, 17, 0)   # 15:30 → 17:00
 
 # =========================
 # ENV
@@ -46,13 +46,8 @@ SUBSCRIBERS = set()
 # =========================
 # STATE
 # =========================
-ANALYZED = 0
 NO_TRADE_CANDLES = 0
-NEAR_COUNT = 0
-
-NEAR_SIGNAL_SENT = False
 NEAR_CANDLES_COUNT = 0
-LAST_NEAR_LEVEL = None
 
 # =========================
 # DATA
@@ -101,10 +96,10 @@ def liquidity_sweep(h,l,c):
     ph = max(h[-ICT_LOOKBACK:-1])
     pl = min(l[-ICT_LOOKBACK:-1])
     if h[-1] > ph and c[-1] < ph:
-        return "SELL"
+        return "SELL", ph
     if l[-1] < pl and c[-1] > pl:
-        return "BUY"
-    return None
+        return "BUY", pl
+    return None, None
 
 def fvg(h,l,dir):
     if dir=="BUY" and l[-1] > h[-3]:
@@ -114,23 +109,30 @@ def fvg(h,l,dir):
     return False
 
 # =========================
-# SESSION FILTER
+# KILLZONE FILTER
 # =========================
-def in_session():
-    hr = dz_now().hour
-    return (LONDON[0] <= hr < LONDON[1]) or (NEWYORK[0] <= hr < NEWYORK[1])
+def in_killzone():
+    now = dz_now()
+    h, m = now.hour, now.minute
+
+    if LONDON_KZ[0] <= h <= LONDON_KZ[1]:
+        if h < LONDON_KZ[1] or m <= LONDON_KZ[2]:
+            return "London"
+
+    if (h > NY_KZ[0] or (h == NY_KZ[0] and m >= NY_KZ[1])) and \
+       (h < NY_KZ[2] or (h == NY_KZ[2] and m <= NY_KZ[3])):
+        return "NewYork"
+
+    return None
 
 # =========================
 # ANALYSIS
 # =========================
 def analyze():
-    global ANALYZED, NO_TRADE_CANDLES
-    global NEAR_SIGNAL_SENT, NEAR_CANDLES_COUNT, LAST_NEAR_LEVEL
+    global NO_TRADE_CANDLES, NEAR_CANDLES_COUNT
 
-    ANALYZED += 1
-    NEAR_SIGNAL_SENT = False
-
-    if not in_session():
+    session = in_killzone()
+    if not session:
         return None
 
     cs = get_candles()
@@ -150,6 +152,7 @@ def analyze():
     conf = 0
     direction = None
 
+    # RSI
     if r <= RSI_BUY:
         conf += 20
         direction = "BUY"
@@ -159,6 +162,7 @@ def analyze():
     else:
         return None
 
+    # EMA
     if price > e20 and price > e50:
         conf += 20
         direction = "BUY"
@@ -168,39 +172,39 @@ def analyze():
     else:
         return None
 
-    if a >= MIN_ATR:
-        conf += 10
-    else:
+    if a < MIN_ATR:
+        return None
+    conf += 10
+
+    # ICT Sweep
+    sweep_dir, sweep_level = liquidity_sweep(h,l,c)
+    if sweep_dir != direction:
         return None
 
-    sweep = liquidity_sweep(h,l,c)
-    if not sweep or sweep != direction:
-        return None
-
+    # FVG
     if not fvg(h,l,direction):
         return None
 
-    # ===== Near level =====
-    LAST_NEAR_LEVEL = max(h[-5:]) if direction=="SELL" else min(l[-5:])
-
-    # ===== Near Trade Alert =====
-    if conf < MIN_CONFIDENCE:
-        NEAR_CANDLES_COUNT += 1
-        if conf >= MIN_CONFIDENCE - 10 and not NEAR_SIGNAL_SENT:
-            NEAR_SIGNAL_SENT = True
-            for u in SUBSCRIBERS:
-                bot.send_message(
-                    u,
-                    f"""🚨 صفقة محتملة خلال شمعة
-📊 XAUUSD – M15
-📍 المستوى الحرج: {LAST_NEAR_LEVEL:.2f}
-🧠 Confidence: {conf}%
-⏳ قربنا من صفقة منذ {NEAR_CANDLES_COUNT} شموع
-⚠️ انتظر إغلاق الشمعة"""
-                )
+    # 🔥 Breakout Confirmation
+    if direction == "BUY" and c[-1] <= sweep_level:
+        bot_send("❌ فشل سيناريو ICT\nالسبب: كسر بدون تأكيد")
         return None
 
-    # ===== Trade Confirmed =====
+    if direction == "SELL" and c[-1] >= sweep_level:
+        bot_send("❌ فشل سيناريو ICT\nالسبب: كسر بدون تأكيد")
+        return None
+
+    conf += 30
+
+    if conf < MIN_CONFIDENCE:
+        NEAR_CANDLES_COUNT += 1
+        bot_send(
+            f"🚨 قرب صفقة – {session}\n"
+            f"⏳ منذ {NEAR_CANDLES_COUNT} شموع\n"
+            f"🧠 Confidence: {conf}%"
+        )
+        return None
+
     NO_TRADE_CANDLES = 0
     NEAR_CANDLES_COUNT = 0
 
@@ -208,14 +212,21 @@ def analyze():
         "dir": direction,
         "price": price,
         "atr": a,
-        "conf": conf
+        "conf": conf,
+        "session": session
     }
+
+# =========================
+# BOT SEND
+# =========================
+def bot_send(text):
+    for u in SUBSCRIBERS:
+        bot.send_message(u, text)
 
 # =========================
 # LOOP
 # =========================
 def loop():
-    global NO_TRADE_CANDLES
     while True:
         try:
             res = analyze()
@@ -225,23 +236,20 @@ def loop():
                 tp = entry + a*R_TP if res["dir"]=="BUY" else entry - a*R_TP
                 sl = entry - a*R_SL if res["dir"]=="BUY" else entry + a*R_SL
 
-                for u in SUBSCRIBERS:
-                    bot.send_message(
-                        u,
-                        f"""📊 XAUUSD – M15
-{'🟢 BUY' if res['dir']=='BUY' else '🔴 SELL'} @ {entry:.2f}
-🎯 TP: {tp:.2f}
-❌ SL: {sl:.2f}
+                bot_send(
+                    f"""📊 XAUUSD – M15
+{'🟢 BUY' if res['dir']=='BUY' else '🔴 SELL'}
+Session: {res['session']}
+Entry: {entry:.2f}
+TP: {tp:.2f}
+SL: {sl:.2f}
 🧠 Confidence: {res['conf']}%"""
-                    )
-            else:
-                NO_TRADE_CANDLES += 1
+                )
 
         except Exception as e:
             print("ERROR:", e)
 
-        for _ in range(CHECK_EVERY):
-            time.sleep(1)
+        time.sleep(CHECK_EVERY)
 
 # =========================
 # COMMAND
@@ -251,7 +259,11 @@ def start(m):
     SUBSCRIBERS.add(m.chat.id)
     bot.send_message(
         m.chat.id,
-        "🤖 البوت يعمل\nICT + Near Trade Alert مفعّل\nM15 – Confidence 60"
+        "🤖 البوت يعمل\n"
+        "ICT + Breakout Confirmation\n"
+        "Killzone دقيقة (London / NY)\n"
+        "Confidence = 60\n"
+        "فريم M15"
     )
 
 # =========================
