@@ -15,11 +15,14 @@ PAIR = "XAUUSD"
 INTERVAL = "15min"
 CHECK_EVERY = 900  # 15 minutes
 
-# تخفيف ذكي
+# Smart conditions
 MIN_CONFIDENCE = 60
 RSI_BUY = 35
 RSI_SELL = 65
 MIN_ATR = 1.5
+
+BREAKOUT_LOOKBACK = 20   # عدد الشموع
+BREAKOUT_BUFFER = 0.2   # هامش كسر (للذهب)
 
 # =========================
 # ENV VARIABLES
@@ -68,7 +71,7 @@ def get_price():
     )
     return float(r.json()["rates"]["XAU"])
 
-def get_candles(limit=150):
+def get_candles(limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -119,7 +122,7 @@ def analyze_market():
     reasons = []
     candles = get_candles()
 
-    if len(candles) < 80:
+    if len(candles) < 100:
         return ["بيانات غير كافية"]
 
     closes = [float(c["close"]) for c in candles]
@@ -139,9 +142,9 @@ def analyze_market():
     if r <= RSI_BUY or r >= RSI_SELL:
         confidence += 30
     else:
-        reasons.append(f"RSI غير مناسب ({r:.2f})")
+        reasons.append(f"RSI حيادي ({r:.2f})")
 
-    # EMA Trend
+    # EMA trend
     if price > e20 and price > e50:
         trend = "BUY"
         confidence += 25
@@ -157,10 +160,23 @@ def analyze_market():
     else:
         reasons.append(f"ATR ضعيف ({a:.2f})")
 
+    # ===== Breakout Filter =====
+    recent_high = max(highs[-BREAKOUT_LOOKBACK:])
+    recent_low = min(lows[-BREAKOUT_LOOKBACK:])
+
+    if price > recent_high + BREAKOUT_BUFFER:
+        confidence += 20
+        trend = "BUY"
+    elif price < recent_low - BREAKOUT_BUFFER:
+        confidence += 20
+        trend = "SELL"
+    else:
+        reasons.append("لا يوجد كسر سعري (Breakout)")
+
     if confidence < MIN_CONFIDENCE:
         reasons.append(f"Confidence منخفض ({confidence}%)")
 
-    if reasons:
+    if reasons and confidence < MIN_CONFIDENCE:
         return reasons
 
     return {
@@ -227,36 +243,13 @@ def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 DEBUG MODE مفعل"
-    )
-
-@bot.message_handler(commands=["stats"])
-def stats(message):
-    with open(TRADES_FILE, "r") as f:
-        rows = list(csv.DictReader(f))
-
-    total = len(rows)
-    wins = sum(1 for r in rows if r["result"] == "WIN")
-    losses = sum(1 for r in rows if r["result"] == "LOSS")
-    winrate = round((wins / total) * 100, 2) if total else 0
-
-    bot.send_message(
-        message.chat.id,
-        f"""
-📊 XAUUSD – إحصائيات الأداء
-
-Total Trades: {total}
-Wins: {wins}
-Losses: {losses}
-Win Rate: {winrate}%
-"""
+        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 Breakout Filter مفعل"
     )
 
 @bot.message_handler(commands=["force"])
 def force_trade(message):
     price = get_price()
     atr_val = 5.0
-
     tp = price - atr_val * 2.5
     sl = price + atr_val * 1.5
 
@@ -279,5 +272,5 @@ XAUUSD – M15
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED – M15 MODE")
+print("🤖 BOT STARTED – M15 + BREAKOUT")
 bot.infinity_polling()
