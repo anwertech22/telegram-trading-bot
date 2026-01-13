@@ -16,10 +16,12 @@ PAIR = "XAUUSD"
 INTERVAL = "15min"
 CHECK_EVERY = 900  # seconds
 
-# Strategy
+# ====== STRATEGY CORE ======
 RSI_BUY = 40
 RSI_SELL = 60
-MIN_CONFIDENCE = 60
+
+MIN_CONFIDENCE = 60   # ⬅️ تم التخفيض من 70 إلى 60 (اختبار ذكي)
+
 MIN_ATR = 1.5
 
 # Breakout
@@ -38,7 +40,7 @@ BE_R = 1.0
 TRAIL_R = 2.0
 TRAIL_STEP = 0.5
 
-# Sessions (Algeria time)
+# Sessions (Algeria Time)
 LONDON = (9, 12)
 NEWYORK = (15, 18)
 
@@ -47,6 +49,7 @@ NEWYORK = (15, 18)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TD_API_KEY = os.getenv("TD_API_KEY")
+
 if not BOT_TOKEN or not TD_API_KEY:
     raise Exception("Missing ENV")
 
@@ -68,7 +71,12 @@ LAST_REPORT_DATE = None
 def get_candles(limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
-        params={"symbol":"XAU/USD","interval":INTERVAL,"outputsize":limit,"apikey":TD_API_KEY},
+        params={
+            "symbol": "XAU/USD",
+            "interval": INTERVAL,
+            "outputsize": limit,
+            "apikey": TD_API_KEY
+        },
         timeout=10
     )
     data = r.json().get("values", [])
@@ -76,12 +84,14 @@ def get_candles(limit=200):
     return data
 
 def ema(vals, p):
-    k = 2/(p+1); e = sum(vals[:p])/p
-    for v in vals[p:]: e = v*k + e*(1-k)
+    k = 2/(p+1)
+    e = sum(vals[:p])/p
+    for v in vals[p:]:
+        e = v*k + e*(1-k)
     return e
 
 def rsi(vals, p=14):
-    g,l=[],[]
+    g,l = [],[]
     for i in range(1,p+1):
         d = vals[-i]-vals[-i-1]
         (g if d>=0 else l).append(abs(d))
@@ -96,17 +106,22 @@ def atr(h,l,c,p=14):
     return sum(t)/p
 
 # =========================
-# ICT
+# ICT LOGIC
 # =========================
 def liquidity_sweep(h,l,c):
-    ph, pl = max(h[-ICT_LOOKBACK:-1]), min(l[-ICT_LOOKBACK:-1])
-    if h[-1] > ph and c[-1] < ph: return "SELL"
-    if l[-1] < pl and c[-1] > pl: return "BUY"
+    ph = max(h[-ICT_LOOKBACK:-1])
+    pl = min(l[-ICT_LOOKBACK:-1])
+    if h[-1] > ph and c[-1] < ph:
+        return "SELL"
+    if l[-1] < pl and c[-1] > pl:
+        return "BUY"
     return None
 
 def fvg(h,l,dir):
-    if dir=="BUY" and l[-1] > h[-3]: return True
-    if dir=="SELL" and h[-1] < l[-3]: return True
+    if dir=="BUY" and l[-1] > h[-3]:
+        return True
+    if dir=="SELL" and h[-1] < l[-3]:
+        return True
     return False
 
 # =========================
@@ -125,17 +140,18 @@ def premium_discount(h,l,price,dir):
     return (price < mid if dir=="BUY" else price > mid)
 
 # =========================
-# ANALYZE
+# ANALYSIS
 # =========================
 def analyze():
     global ANALYZED, NO_TRADE_CANDLES, NEAR_COUNT
     ANALYZED += 1
 
     if not in_session():
-        return ["خارج جلسات لندن/نيويورك"]
+        return ["خارج جلسات التداول"]
 
     cs = get_candles()
-    if len(cs)<100: return ["بيانات غير كافية"]
+    if len(cs) < 100:
+        return ["بيانات غير كافية"]
 
     c = [float(x["close"]) for x in cs]
     h = [float(x["high"]) for x in cs]
@@ -146,73 +162,56 @@ def analyze():
     e20, e50 = ema(c[-40:],20), ema(c[-80:],50)
     a = atr(h,l,c)
 
-    conf, dir, reasons = 0, None, []
+    conf = 0
+    direction = None
+    reasons = []
 
-    if r<=RSI_BUY: conf+=20; dir="BUY"
-    elif r>=RSI_SELL: conf+=20; dir="SELL"
-    else: reasons.append("RSI حيادي")
+    if r <= RSI_BUY:
+        conf += 20
+        direction = "BUY"
+    elif r >= RSI_SELL:
+        conf += 20
+        direction = "SELL"
+    else:
+        reasons.append("RSI حيادي")
 
-    if price>e20 and price>e50: conf+=20; dir="BUY"
-    elif price<e20 and price<e50: conf+=20; dir="SELL"
-    else: reasons.append("بين EMA")
+    if price > e20 and price > e50:
+        conf += 20
+        direction = "BUY"
+    elif price < e20 and price < e50:
+        conf += 20
+        direction = "SELL"
+    else:
+        reasons.append("بين EMA")
 
-    if a>=MIN_ATR: conf+=10
-    else: reasons.append("ATR ضعيف")
+    if a >= MIN_ATR:
+        conf += 10
+    else:
+        reasons.append("ATR ضعيف")
 
     sweep = liquidity_sweep(h,l,c)
-    if not sweep or sweep!=dir: return ["لا يوجد Liquidity Sweep صالح"]
+    if not sweep or sweep != direction:
+        return ["لا يوجد Liquidity Sweep صالح"]
 
-    if not fvg(h,l,dir): return ["لا يوجد FVG"]
+    if not fvg(h,l,direction):
+        return ["لا يوجد FVG"]
 
-    if not premium_discount(h,l,price,dir): return ["ليس في Premium/Discount"]
+    if not premium_discount(h,l,price,direction):
+        return ["ليس في Premium/Discount"]
 
     conf += 30
-    if conf<MIN_CONFIDENCE:
-        NEAR_COUNT+=1
-        return ["قريب من الصفقة"]
+
+    if conf < MIN_CONFIDENCE:
+        NEAR_COUNT += 1
+        return [f"Confidence منخفض ({conf}%)"]
 
     NO_TRADE_CANDLES = 0
-    return {"dir":dir,"price":price,"atr":a,"conf":conf}
-
-# =========================
-# TRADE MGMT (Virtual)
-# =========================
-def manage_trade():
-    global OPEN_TRADE
-    if not OPEN_TRADE: return
-    price = OPEN_TRADE["price_now"]()
-    entry, sl, tp = OPEN_TRADE["entry"], OPEN_TRADE["sl"], OPEN_TRADE["tp"]
-    r = abs(entry-sl)
-    profit = (price-entry) if OPEN_TRADE["dir"]=="BUY" else (entry-price)
-
-    if profit >= BE_R*r and not OPEN_TRADE["be"]:
-        OPEN_TRADE["sl"] = entry
-        OPEN_TRADE["be"] = True
-
-    if profit >= TRAIL_R*r:
-        step = TRAIL_STEP*r
-        if OPEN_TRADE["dir"]=="BUY":
-            OPEN_TRADE["sl"] = max(OPEN_TRADE["sl"], price-step)
-        else:
-            OPEN_TRADE["sl"] = min(OPEN_TRADE["sl"], price+step)
-
-# =========================
-# DAILY REPORT
-# =========================
-def daily_report():
-    global LAST_REPORT_DATE, ANALYZED, NEAR_COUNT, NO_TRADE_CANDLES
-    today = dz_now().date()
-    if LAST_REPORT_DATE==today: return
-    if dz_now().hour==23:
-        for u in SUBSCRIBERS:
-            bot.send_message(u,
-f"""📊 تقرير XAUUSD اليومي (M15)
-🔍 شمعات محللة: {ANALYZED}
-⚠️ Near: {NEAR_COUNT}
-⏳ بدون صفقة: {NO_TRADE_CANDLES}
-🕒 الجزائر 🇩🇿""")
-        LAST_REPORT_DATE=today
-        ANALYZED=NEAR_COUNT=0
+    return {
+        "dir": direction,
+        "price": price,
+        "atr": a,
+        "conf": conf
+    }
 
 # =========================
 # LOOP
@@ -227,38 +226,41 @@ def loop():
                 a = res["atr"]
                 tp = entry + a*R_TP if res["dir"]=="BUY" else entry - a*R_TP
                 sl = entry - a*R_SL if res["dir"]=="BUY" else entry + a*R_SL
-                OPEN_TRADE = {"dir":res["dir"],"entry":entry,"sl":sl,"tp":tp,"be":False,
-                              "price_now":lambda: entry}
+
                 for u in SUBSCRIBERS:
-                    bot.send_message(u,
-f"""📊 XAUUSD – M15 (ICT)
+                    bot.send_message(
+                        u,
+                        f"""📊 XAUUSD – M15 (TEST MODE)
 {'🟢 BUY' if res['dir']=='BUY' else '🔴 SELL'} @ {entry:.2f}
 🎯 TP: {tp:.2f}
 ❌ SL: {sl:.2f}
-🧠 Conf: {res['conf']}%""")
+🧠 Confidence: {res['conf']}%"""
+                    )
             else:
                 NO_TRADE_CANDLES += 1
                 if DEBUG:
                     for u in SUBSCRIBERS:
-                        bot.send_message(u,"🧪 DEBUG\n"+"\n".join("❌ "+x for x in res))
-                if NO_TRADE_CANDLES%8==0:
-                    for u in SUBSCRIBERS:
-                        bot.send_message(u,f"⏳ لا توجد صفقات منذ {NO_TRADE_CANDLES} شمعات")
-            daily_report()
+                        bot.send_message(u, "🧪 DEBUG\n" + "\n".join("❌ "+x for x in res))
+
         except Exception as e:
-            print("ERR",e)
-        for _ in range(CHECK_EVERY): time.sleep(1)
+            print("ERROR:", e)
+
+        for _ in range(CHECK_EVERY):
+            time.sleep(1)
 
 # =========================
-# COMMANDS
+# COMMAND
 # =========================
 @bot.message_handler(commands=["start"])
 def start(m):
     SUBSCRIBERS.add(m.chat.id)
-    bot.send_message(m.chat.id,"🤖 البوت يعمل\n🧠 ICT + Sessions + Risk Mgmt")
+    bot.send_message(
+        m.chat.id,
+        "🤖 البوت يعمل\n🧪 Test Mode: Confidence = 60\n⏱️ M15"
+    )
 
 # =========================
 # START
 # =========================
-Thread(target=loop,daemon=True).start()
+Thread(target=loop, daemon=True).start()
 bot.infinity_polling()
