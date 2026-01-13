@@ -99,6 +99,43 @@ def calculate_atr(highs, lows, closes, period=14):
     return round(sum(trs) / period, 2)
 
 # =========================
+# Confidence Engine
+# =========================
+def calculate_confidence(rsi, price, ema20, ema50, atr, news_ok, direction):
+    score = 0
+    reasons = []
+
+    # RSI
+    if (direction == "SELL" and rsi >= 70) or (direction == "BUY" and rsi <= 30):
+        score += 30
+        reasons.append("RSI متطرف")
+
+    # Trend
+    if direction == "SELL" and price < ema20 and price < ema50:
+        score += 25
+        reasons.append("اتجاه هابط")
+    if direction == "BUY" and price > ema20 and price > ema50:
+        score += 25
+        reasons.append("اتجاه صاعد")
+
+    # Momentum (distance from EMA20)
+    if abs(price - ema20) >= atr * 0.3:
+        score += 15
+        reasons.append("زخم كافٍ")
+
+    # ATR sanity
+    if atr >= 3:
+        score += 15
+        reasons.append("تذبذب مناسب")
+
+    # News
+    if news_ok:
+        score += 15
+        reasons.append("لا أخبار")
+
+    return score, reasons
+
+# =========================
 # Signal Logic
 # =========================
 def analyze_market():
@@ -110,37 +147,38 @@ def analyze_market():
     ema50 = calculate_ema(closes, 50)
     atr = calculate_atr(highs, lows, closes)
 
-    sl_dist = round(atr * 1.5, 2)
-    tp_dist = round(atr * 2.5, 2)
+    # Decide direction candidate
+    candidates = []
+    if rsi >= 70:
+        candidates.append("SELL")
+    if rsi <= 30:
+        candidates.append("BUY")
 
-    if rsi >= 70 and price < ema20 and price < ema50:
-        return ("SELL", f"""
+    if not candidates:
+        return ("NO_TRADE", None)
+
+    for direction in candidates:
+        conf, reasons = calculate_confidence(
+            rsi, price, ema20, ema50, atr, not is_news_time(), direction
+        )
+        if conf >= 70:
+            sl = round(price + (atr * 1.5), 2) if direction == "SELL" else round(price - (atr * 1.5), 2)
+            tp = round(price - (atr * 2.5), 2) if direction == "SELL" else round(price + (atr * 2.5), 2)
+            return (direction, f"""
 📊 XAUUSD – M5
-🔴 SELL @ {price}
+{"🔴 SELL" if direction=="SELL" else "🟢 BUY"} @ {price}
 
 RSI: {rsi}
 EMA20: {ema20}
 EMA50: {ema50}
-ATR(14): {atr}
+ATR: {atr}
 
-🎯 TP: {round(price - tp_dist, 2)}
-❌ SL: {round(price + sl_dist, 2)}
-RR ≈ 1 : 1.6
-""")
+🎯 TP: {tp}
+❌ SL: {sl}
 
-    if rsi <= 30 and price > ema20 and price > ema50:
-        return ("BUY", f"""
-📊 XAUUSD – M5
-🟢 BUY @ {price}
-
-RSI: {rsi}
-EMA20: {ema20}
-EMA50: {ema50}
-ATR(14): {atr}
-
-🎯 TP: {round(price + tp_dist, 2)}
-❌ SL: {round(price - sl_dist, 2)}
-RR ≈ 1 : 1.6
+Confidence: {conf}%
+Reasons:
+- {" | ".join(reasons)}
 """)
 
     return ("NO_TRADE", None)
@@ -177,14 +215,13 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "🤖 إشارات تلقائية مفعّلة\n"
-        "📉 RSI + EMA + ATR\n"
-        "📰 فلترة أخبار\n"
-        "⏱️ كل 5 دقائق"
+        "🧠 نظام Confidence بالنقاط\n"
+        "⏱️ فحص كل 5 دقائق"
     )
 
 # =========================
 # Run
 # =========================
 Thread(target=auto_loop).start()
-print("🤖 Bot running with ATR-based TP/SL")
+print("🤖 Bot running with CONFIDENCE ENGINE")
 bot.polling(none_stop=True)
