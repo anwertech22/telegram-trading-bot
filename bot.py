@@ -15,15 +15,14 @@ PAIR = "XAUUSD"
 INTERVAL = "15min"
 CHECK_EVERY = 900  # 15 minutes
 
-# ===== STRATEGY TUNING =====
-RSI_BUY = 40       # مخفف
-RSI_SELL = 60      # مخفف
+RSI_BUY = 40
+RSI_SELL = 60
 MIN_CONFIDENCE = 60
 NEAR_CONFIDENCE = 45
 
 BREAKOUT_LOOKBACK = 20
 BREAKOUT_BUFFER = 0.2
-BREAKOUT_WEIGHT = 30   # مرفوع
+BREAKOUT_WEIGHT = 30
 
 MIN_ATR = 1.5
 
@@ -141,7 +140,6 @@ def analyze_market():
     confidence = 0
     direction = None
 
-    # ===== RSI =====
     if r <= RSI_BUY:
         confidence += 25
         direction = "BUY"
@@ -151,7 +149,6 @@ def analyze_market():
     else:
         reasons.append(f"RSI ({r:.2f}) حيادي")
 
-    # ===== EMA TREND =====
     if price > e20 and price > e50:
         confidence += 20
         direction = "BUY"
@@ -161,13 +158,11 @@ def analyze_market():
     else:
         reasons.append("السعر بين EMA20 و EMA50")
 
-    # ===== ATR =====
     if a >= MIN_ATR:
         confidence += 15
     else:
         reasons.append(f"ATR ضعيف ({a:.2f})")
 
-    # ===== BREAKOUT FILTER =====
     recent_high = max(highs[-BREAKOUT_LOOKBACK:])
     recent_low = min(lows[-BREAKOUT_LOOKBACK:])
 
@@ -183,7 +178,6 @@ def analyze_market():
     else:
         reasons.append("لا يوجد Breakout")
 
-    # ===== NEAR SIGNAL WARNING =====
     if NEAR_CONFIDENCE <= confidence < MIN_CONFIDENCE:
         return {
             "near": True,
@@ -205,7 +199,7 @@ def analyze_market():
     }
 
 # =========================
-# AUTO LOOP
+# AUTO LOOP (NON-BLOCKING)
 # =========================
 def auto_loop():
     global OPEN_TRADE
@@ -214,7 +208,6 @@ def auto_loop():
             if OPEN_TRADE is None:
                 result = analyze_market()
 
-                # ===== DEBUG / NO TRADE =====
                 if isinstance(result, list):
                     if DEBUG:
                         for uid in SUBSCRIBERS:
@@ -224,7 +217,6 @@ def auto_loop():
                                 "\n".join(f"❌ {r}" for r in result)
                             )
 
-                # ===== NEAR TRADE =====
                 elif isinstance(result, dict) and result.get("near"):
                     for uid in SUBSCRIBERS:
                         bot.send_message(
@@ -238,7 +230,6 @@ Breakout: {'نعم' if result['breakout'] else 'قريب'}
 """
                         )
 
-                # ===== REAL TRADE =====
                 else:
                     direction = result["direction"]
                     price = result["price"]
@@ -266,7 +257,9 @@ Breakout: {'نعم' if result['breakout'] else 'قريب'}
         except Exception as e:
             print("ERROR:", e)
 
-        time.sleep(CHECK_EVERY)
+        # ✅ NON-BLOCKING WAIT
+        for _ in range(CHECK_EVERY):
+            time.sleep(1)
 
 # =========================
 # COMMANDS
@@ -306,5 +299,5 @@ XAUUSD – M15
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED – M15 (SMART MODE)")
+print("🤖 BOT STARTED – M15 (STABLE MODE)")
 bot.infinity_polling()
