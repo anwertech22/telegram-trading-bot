@@ -1,5 +1,6 @@
 import os
 import time
+import csv
 import requests
 import telebot
 from datetime import datetime
@@ -9,17 +10,19 @@ from threading import Thread
 # CONFIG
 # =========================
 DEBUG = True
-PAIR = "XAUUSD"
-INTERVAL = "5min"
-CHECK_EVERY = 300  # 5 minutes
 
-MIN_CONFIDENCE = 70
-RSI_BUY = 30
-RSI_SELL = 70
+PAIR = "XAUUSD"
+INTERVAL = "15min"
+CHECK_EVERY = 900  # 15 minutes
+
+# تخفيف ذكي
+MIN_CONFIDENCE = 60
+RSI_BUY = 35
+RSI_SELL = 65
 MIN_ATR = 1.5
 
 # =========================
-# ENV
+# ENV VARIABLES
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 METALS_API_KEY = os.getenv("METALS_API_KEY")
@@ -32,10 +35,32 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 SUBSCRIBERS = set()
 OPEN_TRADE = None
+TRADES_FILE = "trades.csv"
+
+# =========================
+# INIT CSV
+# =========================
+if not os.path.exists(TRADES_FILE):
+    with open(TRADES_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "pair", "direction", "entry", "tp", "sl", "result"])
 
 # =========================
 # HELPERS
 # =========================
+def save_trade(direction, entry, tp, sl, result="OPEN"):
+    with open(TRADES_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            PAIR,
+            direction,
+            entry,
+            tp,
+            sl,
+            result
+        ])
+
 def get_price():
     r = requests.get(
         "https://api.metals.dev/v1/latest",
@@ -43,7 +68,7 @@ def get_price():
     )
     return float(r.json()["rates"]["XAU"])
 
-def get_candles(limit=100):
+def get_candles(limit=150):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -92,11 +117,10 @@ def atr(highs, lows, closes, period=14):
 # =========================
 def analyze_market():
     reasons = []
-
     candles = get_candles()
-    if len(candles) < 60:
-        reasons.append("بيانات غير كافية")
-        return reasons
+
+    if len(candles) < 80:
+        return ["بيانات غير كافية"]
 
     closes = [float(c["close"]) for c in candles]
     highs = [float(c["high"]) for c in candles]
@@ -109,6 +133,7 @@ def analyze_market():
     a = atr(highs, lows, closes)
 
     confidence = 0
+    trend = None
 
     # RSI
     if r <= RSI_BUY or r >= RSI_SELL:
@@ -124,7 +149,6 @@ def analyze_market():
         trend = "SELL"
         confidence += 25
     else:
-        trend = None
         reasons.append("السعر بين EMA20 و EMA50")
 
     # ATR
@@ -133,7 +157,6 @@ def analyze_market():
     else:
         reasons.append(f"ATR ضعيف ({a:.2f})")
 
-    # Final decision
     if confidence < MIN_CONFIDENCE:
         reasons.append(f"Confidence منخفض ({confidence}%)")
 
@@ -148,11 +171,10 @@ def analyze_market():
     }
 
 # =========================
-# LOOP
+# AUTO LOOP
 # =========================
 def auto_loop():
     global OPEN_TRADE
-
     while True:
         try:
             print("🔍 Checking market", datetime.utcnow())
@@ -171,16 +193,18 @@ def auto_loop():
                 else:
                     direction = result["direction"]
                     price = result["price"]
-                    atr_val = result["atr"]
+                    a = result["atr"]
 
-                    tp = price + atr_val * 2.5 if direction == "BUY" else price - atr_val * 2.5
-                    sl = price - atr_val * 1.5 if direction == "BUY" else price + atr_val * 1.5
+                    tp = price + a * 2.5 if direction == "BUY" else price - a * 2.5
+                    sl = price - a * 1.5 if direction == "BUY" else price + a * 1.5
+
+                    save_trade(direction, price, tp, sl)
 
                     for uid in SUBSCRIBERS:
                         bot.send_message(
                             uid,
                             f"""
-📊 XAUUSD – M5
+📊 XAUUSD – M15
 {'🟢 BUY' if direction=='BUY' else '🔴 SELL'} @ {price:.2f}
 🎯 TP: {tp:.2f}
 ❌ SL: {sl:.2f}
@@ -203,19 +227,57 @@ def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 البوت يعمل\n⏱️ فحص كل 5 دقائق\n🧪 DEBUG MODE مفعل"
+        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 DEBUG MODE مفعل"
+    )
+
+@bot.message_handler(commands=["stats"])
+def stats(message):
+    with open(TRADES_FILE, "r") as f:
+        rows = list(csv.DictReader(f))
+
+    total = len(rows)
+    wins = sum(1 for r in rows if r["result"] == "WIN")
+    losses = sum(1 for r in rows if r["result"] == "LOSS")
+    winrate = round((wins / total) * 100, 2) if total else 0
+
+    bot.send_message(
+        message.chat.id,
+        f"""
+📊 XAUUSD – إحصائيات الأداء
+
+Total Trades: {total}
+Wins: {wins}
+Losses: {losses}
+Win Rate: {winrate}%
+"""
     )
 
 @bot.message_handler(commands=["force"])
-def force(message):
+def force_trade(message):
+    price = get_price()
+    atr_val = 5.0
+
+    tp = price - atr_val * 2.5
+    sl = price + atr_val * 1.5
+
+    save_trade("SELL", price, tp, sl)
+
     bot.send_message(
         message.chat.id,
-        "🧪 FORCED TRADE TEST\nSELL XAUUSD @ السعر الحالي"
+        f"""
+🧪 FORCED TRADE (TEST)
+
+XAUUSD – M15
+🔴 SELL @ {price:.2f}
+🎯 TP: {tp:.2f}
+❌ SL: {sl:.2f}
+🧠 Confidence: 100%
+"""
     )
 
 # =========================
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED WITH DEBUG MODE")
+print("🤖 BOT STARTED – M15 MODE")
 bot.infinity_polling()
