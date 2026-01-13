@@ -16,21 +16,26 @@ PAIR = "XAUUSD"
 INTERVAL = "15min"
 CHECK_EVERY = 900
 
+# ===== ACCOUNT MODE =====
+SMALL_ACCOUNT_MODE = True   # 🔥 مفعل
+LOT_SIZE = 0.02
+
+# ===== STRATEGY =====
 RSI_BUY = 40
 RSI_SELL = 60
 MIN_CONFIDENCE = 60
-MIN_ATR = 1.5
+MIN_ATR = 1.0
 
 # ICT
 ICT_LOOKBACK = 20
 
-# Risk
-R_TP = 2.5
-R_SL = 1.5
+# ===== QUICK PROFIT (لوت 0.02) =====
+TP_ATR_MULTIPLIER = 0.6     # خروج سريع
+SL_ATR_MULTIPLIER = 0.8
 
-# 🔥 Killzones الدقيقة (الجزائر)
-LONDON_KZ = (9, 10, 30)    # 09:00 → 10:30
-NY_KZ = (15, 30, 17, 0)   # 15:30 → 17:00
+# ===== Killzones (الجزائر) =====
+LONDON_KZ = (9, 10, 30)     # 09:00 → 10:30
+NY_KZ = (15, 30, 17, 0)     # 15:30 → 17:00
 
 # =========================
 # ENV
@@ -42,12 +47,6 @@ if not BOT_TOKEN or not TD_API_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 SUBSCRIBERS = set()
-
-# =========================
-# STATE
-# =========================
-NO_TRADE_CANDLES = 0
-NEAR_CANDLES_COUNT = 0
 
 # =========================
 # DATA
@@ -90,7 +89,7 @@ def atr(h,l,c,p=14):
     return sum(t)/p
 
 # =========================
-# ICT LOGIC
+# ICT
 # =========================
 def liquidity_sweep(h,l,c):
     ph = max(h[-ICT_LOOKBACK:-1])
@@ -109,15 +108,14 @@ def fvg(h,l,dir):
     return False
 
 # =========================
-# KILLZONE FILTER
+# KILLZONE
 # =========================
 def in_killzone():
     now = dz_now()
     h, m = now.hour, now.minute
 
-    if LONDON_KZ[0] <= h <= LONDON_KZ[1]:
-        if h < LONDON_KZ[1] or m <= LONDON_KZ[2]:
-            return "London"
+    if h == LONDON_KZ[0] or (h == LONDON_KZ[1] and m <= LONDON_KZ[2]):
+        return "London"
 
     if (h > NY_KZ[0] or (h == NY_KZ[0] and m >= NY_KZ[1])) and \
        (h < NY_KZ[2] or (h == NY_KZ[2] and m <= NY_KZ[3])):
@@ -129,8 +127,6 @@ def in_killzone():
 # ANALYSIS
 # =========================
 def analyze():
-    global NO_TRADE_CANDLES, NEAR_CANDLES_COUNT
-
     session = in_killzone()
     if not session:
         return None
@@ -152,23 +148,17 @@ def analyze():
     conf = 0
     direction = None
 
-    # RSI
     if r <= RSI_BUY:
-        conf += 20
-        direction = "BUY"
+        conf += 20; direction="BUY"
     elif r >= RSI_SELL:
-        conf += 20
-        direction = "SELL"
+        conf += 20; direction="SELL"
     else:
         return None
 
-    # EMA
     if price > e20 and price > e50:
-        conf += 20
-        direction = "BUY"
+        conf += 20; direction="BUY"
     elif price < e20 and price < e50:
-        conf += 20
-        direction = "SELL"
+        conf += 20; direction="SELL"
     else:
         return None
 
@@ -176,37 +166,16 @@ def analyze():
         return None
     conf += 10
 
-    # ICT Sweep
     sweep_dir, sweep_level = liquidity_sweep(h,l,c)
     if sweep_dir != direction:
         return None
 
-    # FVG
     if not fvg(h,l,direction):
         return None
 
-    # 🔥 Breakout Confirmation
-    if direction == "BUY" and c[-1] <= sweep_level:
-        bot_send("❌ فشل سيناريو ICT\nالسبب: كسر بدون تأكيد")
-        return None
-
-    if direction == "SELL" and c[-1] >= sweep_level:
-        bot_send("❌ فشل سيناريو ICT\nالسبب: كسر بدون تأكيد")
-        return None
-
     conf += 30
-
     if conf < MIN_CONFIDENCE:
-        NEAR_CANDLES_COUNT += 1
-        bot_send(
-            f"🚨 قرب صفقة – {session}\n"
-            f"⏳ منذ {NEAR_CANDLES_COUNT} شموع\n"
-            f"🧠 Confidence: {conf}%"
-        )
         return None
-
-    NO_TRADE_CANDLES = 0
-    NEAR_CANDLES_COUNT = 0
 
     return {
         "dir": direction,
@@ -215,13 +184,6 @@ def analyze():
         "conf": conf,
         "session": session
     }
-
-# =========================
-# BOT SEND
-# =========================
-def bot_send(text):
-    for u in SUBSCRIBERS:
-        bot.send_message(u, text)
 
 # =========================
 # LOOP
@@ -233,19 +195,24 @@ def loop():
             if isinstance(res, dict):
                 entry = res["price"]
                 a = res["atr"]
-                tp = entry + a*R_TP if res["dir"]=="BUY" else entry - a*R_TP
-                sl = entry - a*R_SL if res["dir"]=="BUY" else entry + a*R_SL
 
-                bot_send(
-                    f"""📊 XAUUSD – M15
+                tp = entry + a*TP_ATR_MULTIPLIER if res["dir"]=="BUY" else entry - a*TP_ATR_MULTIPLIER
+                sl = entry - a*SL_ATR_MULTIPLIER if res["dir"]=="BUY" else entry + a*SL_ATR_MULTIPLIER
+
+                for u in SUBSCRIBERS:
+                    bot.send_message(
+                        u,
+                        f"""📊 XAUUSD – M15 (Small Account Mode)
 {'🟢 BUY' if res['dir']=='BUY' else '🔴 SELL'}
 Session: {res['session']}
+Lot: {LOT_SIZE}
 Entry: {entry:.2f}
 TP: {tp:.2f}
 SL: {sl:.2f}
-🧠 Confidence: {res['conf']}%"""
-                )
+🧠 Confidence: {res['conf']}%
 
+🎯 هدف ربح صغير وسريع"""
+                    )
         except Exception as e:
             print("ERROR:", e)
 
@@ -260,10 +227,9 @@ def start(m):
     bot.send_message(
         m.chat.id,
         "🤖 البوت يعمل\n"
-        "ICT + Breakout Confirmation\n"
-        "Killzone دقيقة (London / NY)\n"
-        "Confidence = 60\n"
-        "فريم M15"
+        "🔥 Small Account Mode مفعل\n"
+        "💰 مناسب لحساب 100$–300$\n"
+        "📈 أهداف ربح صغيرة وسريعة"
     )
 
 # =========================
