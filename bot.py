@@ -11,31 +11,29 @@ def dz_now():
 # =========================
 # CONFIG
 # =========================
-DEBUG = True
-PAIR = "XAUUSD"
-INTERVAL = "15min"
-CHECK_EVERY = 900
-
-# ===== ACCOUNT MODE =====
-SMALL_ACCOUNT_MODE = True   # 🔥 مفعل
+PAIR = "XAU/USD"
 LOT_SIZE = 0.02
 
-# ===== STRATEGY =====
-RSI_BUY = 40
-RSI_SELL = 60
-MIN_CONFIDENCE = 60
-MIN_ATR = 1.0
+# === INTERVALS ===
+ICT_INTERVAL = "15min"
+FAST_INTERVAL = "5min"
 
-# ICT
+CHECK_EVERY = 300  # 5 minutes
+
+# === ICT SETTINGS ===
 ICT_LOOKBACK = 20
+TP_ICT_ATR = 1.8
+SL_ICT_ATR = 1.2
+MIN_CONF_ICT = 70
 
-# ===== QUICK PROFIT (لوت 0.02) =====
-TP_ATR_MULTIPLIER = 0.6     # خروج سريع
-SL_ATR_MULTIPLIER = 0.8
+# === EMA / SCALP SETTINGS ===
+TP_FAST_ATR = 0.6
+SL_FAST_ATR = 0.8
+MIN_CONF_EMA = 60
+MIN_CONF_SCALP = 55
 
-# ===== Killzones (الجزائر) =====
-LONDON_KZ = (9, 10, 30)     # 09:00 → 10:30
-NY_KZ = (15, 30, 17, 0)     # 15:30 → 17:00
+# === DIRECTION COOLDOWN ===
+DIRECTION_COOLDOWN = 60  # minutes
 
 # =========================
 # ENV
@@ -49,14 +47,20 @@ bot = telebot.TeleBot(BOT_TOKEN)
 SUBSCRIBERS = set()
 
 # =========================
-# DATA
+# STATE
 # =========================
-def get_candles(limit=200):
+LAST_TRADE_DIR = None
+LAST_TRADE_TIME = None
+
+# =========================
+# DATA FUNCTIONS
+# =========================
+def get_candles(interval, limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
-            "symbol": "XAU/USD",
-            "interval": INTERVAL,
+            "symbol": PAIR,
+            "interval": interval,
             "outputsize": limit,
             "apikey": TD_API_KEY
         },
@@ -89,49 +93,25 @@ def atr(h,l,c,p=14):
     return sum(t)/p
 
 # =========================
-# ICT
+# DIRECTION FILTER
 # =========================
-def liquidity_sweep(h,l,c):
-    ph = max(h[-ICT_LOOKBACK:-1])
-    pl = min(l[-ICT_LOOKBACK:-1])
-    if h[-1] > ph and c[-1] < ph:
-        return "SELL", ph
-    if l[-1] < pl and c[-1] > pl:
-        return "BUY", pl
-    return None, None
+def direction_allowed(direction):
+    global LAST_TRADE_DIR, LAST_TRADE_TIME
 
-def fvg(h,l,dir):
-    if dir=="BUY" and l[-1] > h[-3]:
+    if LAST_TRADE_DIR is None:
         return True
-    if dir=="SELL" and h[-1] < l[-3]:
+
+    if direction != LAST_TRADE_DIR:
         return True
-    return False
+
+    elapsed = (dz_now() - LAST_TRADE_TIME).total_seconds() / 60
+    return elapsed >= DIRECTION_COOLDOWN
 
 # =========================
-# KILLZONE
+# ICT STRATEGY (STRONG)
 # =========================
-def in_killzone():
-    now = dz_now()
-    h, m = now.hour, now.minute
-
-    if h == LONDON_KZ[0] or (h == LONDON_KZ[1] and m <= LONDON_KZ[2]):
-        return "London"
-
-    if (h > NY_KZ[0] or (h == NY_KZ[0] and m >= NY_KZ[1])) and \
-       (h < NY_KZ[2] or (h == NY_KZ[2] and m <= NY_KZ[3])):
-        return "NewYork"
-
-    return None
-
-# =========================
-# ANALYSIS
-# =========================
-def analyze():
-    session = in_killzone()
-    if not session:
-        return None
-
-    cs = get_candles()
+def ict_strategy():
+    cs = get_candles(ICT_INTERVAL)
     if len(cs) < 100:
         return None
 
@@ -140,79 +120,137 @@ def analyze():
     l = [float(x["low"]) for x in cs]
 
     price = c[-1]
-    r = rsi(c)
     e20 = ema(c[-40:],20)
     e50 = ema(c[-80:],50)
-    a = atr(h,l,c)
 
-    conf = 0
     direction = None
-
-    if r <= RSI_BUY:
-        conf += 20; direction="BUY"
-    elif r >= RSI_SELL:
-        conf += 20; direction="SELL"
-    else:
-        return None
+    conf = 40
 
     if price > e20 and price > e50:
-        conf += 20; direction="BUY"
+        direction = "BUY"
     elif price < e20 and price < e50:
-        conf += 20; direction="SELL"
+        direction = "SELL"
     else:
         return None
 
-    if a < MIN_ATR:
-        return None
-    conf += 10
+    ph = max(h[-ICT_LOOKBACK:-1])
+    pl = min(l[-ICT_LOOKBACK:-1])
 
-    sweep_dir, sweep_level = liquidity_sweep(h,l,c)
-    if sweep_dir != direction:
-        return None
-
-    if not fvg(h,l,direction):
-        return None
-
-    conf += 30
-    if conf < MIN_CONFIDENCE:
+    if direction == "SELL" and h[-1] > ph and c[-1] < ph:
+        conf += 30
+    elif direction == "BUY" and l[-1] < pl and c[-1] > pl:
+        conf += 30
+    else:
         return None
 
-    return {
-        "dir": direction,
-        "price": price,
-        "atr": a,
-        "conf": conf,
-        "session": session
-    }
+    if conf < MIN_CONF_ICT:
+        return None
+
+    a = atr(h,l,c)
+    tp = price + a*TP_ICT_ATR if direction=="BUY" else price - a*TP_ICT_ATR
+    sl = price - a*SL_ICT_ATR if direction=="BUY" else price + a*SL_ICT_ATR
+
+    return ("🟢 صفقة قوية (ICT – M15)", direction, price, tp, sl, conf)
 
 # =========================
-# LOOP
+# EMA STRATEGY (MEDIUM)
+# =========================
+def ema_strategy():
+    cs = get_candles(FAST_INTERVAL)
+    if len(cs) < 60:
+        return None
+
+    c = [float(x["close"]) for x in cs]
+    h = [float(x["high"]) for x in cs]
+    l = [float(x["low"]) for x in cs]
+
+    price = c[-1]
+    e20 = ema(c[-30:],20)
+    e50 = ema(c[-50:],50)
+    r = rsi(c)
+
+    direction = None
+    conf = 40
+
+    if price > e50 and price <= e20 and r < 55:
+        direction = "BUY"
+        conf += 20
+    elif price < e50 and price >= e20 and r > 45:
+        direction = "SELL"
+        conf += 20
+    else:
+        return None
+
+    if conf < MIN_CONF_EMA:
+        return None
+
+    a = atr(h,l,c)
+    tp = price + a*TP_FAST_ATR if direction=="BUY" else price - a*TP_FAST_ATR
+    sl = price - a*SL_FAST_ATR if direction=="BUY" else price + a*SL_FAST_ATR
+
+    return ("🟡 صفقة متوسطة (EMA – M5)", direction, price, tp, sl, conf)
+
+# =========================
+# SCALPING STRATEGY (HIGH RISK)
+# =========================
+def scalp_strategy():
+    cs = get_candles(FAST_INTERVAL)
+    if len(cs) < 40:
+        return None
+
+    c = [float(x["close"]) for x in cs]
+    h = [float(x["high"]) for x in cs]
+    l = [float(x["low"]) for x in cs]
+
+    price = c[-1]
+    r = rsi(c)
+
+    if r < 30:
+        direction = "BUY"
+    elif r > 70:
+        direction = "SELL"
+    else:
+        return None
+
+    conf = 55
+    a = atr(h,l,c)
+    tp = price + a*0.4 if direction=="BUY" else price - a*0.4
+    sl = price - a*0.6 if direction=="BUY" else price + a*0.6
+
+    return ("🔴 صفقة مخاطرة عالية (Scalping – M5)", direction, price, tp, sl, conf)
+
+# =========================
+# MAIN LOOP
 # =========================
 def loop():
+    global LAST_TRADE_DIR, LAST_TRADE_TIME
+
     while True:
         try:
-            res = analyze()
-            if isinstance(res, dict):
-                entry = res["price"]
-                a = res["atr"]
+            for strat in [ict_strategy, ema_strategy, scalp_strategy]:
+                res = strat()
+                if res:
+                    title, direction, price, tp, sl, conf = res
 
-                tp = entry + a*TP_ATR_MULTIPLIER if res["dir"]=="BUY" else entry - a*TP_ATR_MULTIPLIER
-                sl = entry - a*SL_ATR_MULTIPLIER if res["dir"]=="BUY" else entry + a*SL_ATR_MULTIPLIER
+                    if not direction_allowed(direction):
+                        continue
 
-                for u in SUBSCRIBERS:
-                    bot.send_message(
-                        u,
-                        f"""📊 XAUUSD – M15 (Small Account Mode)
-{'🟢 BUY' if res['dir']=='BUY' else '🔴 SELL'}
-Session: {res['session']}
+                    for u in SUBSCRIBERS:
+                        bot.send_message(
+                            u,
+                            f"""{title}
+📊 XAUUSD
+{'🟢 BUY' if direction=='BUY' else '🔴 SELL'}
 Lot: {LOT_SIZE}
-Entry: {entry:.2f}
+Entry: {price:.2f}
 TP: {tp:.2f}
 SL: {sl:.2f}
-🧠 Confidence: {res['conf']}%
+🧠 Confidence: {conf}%"""
+                        )
 
-🎯 هدف ربح صغير وسريع"""
-                    )
+                    LAST_TRADE_DIR = direction
+                    LAST_TRADE_TIME = dz_now()
+                    time.sleep(60)  # anti-spam
         except Exception as e:
             print("ERROR:", e)
 
@@ -227,9 +265,10 @@ def start(m):
     bot.send_message(
         m.chat.id,
         "🤖 البوت يعمل\n"
-        "🔥 Small Account Mode مفعل\n"
-        "💰 مناسب لحساب 100$–300$\n"
-        "📈 أهداف ربح صغيرة وسريعة"
+        "🟢 ICT (قوية)\n"
+        "🟡 EMA (متوسطة)\n"
+        "🔴 Scalping (مخاطرة)\n"
+        "⏱️ منع الاتجاه: 60 دقيقة"
     )
 
 # =========================
