@@ -66,13 +66,6 @@ def save_trade(direction, entry, tp, sl, result="OPEN"):
             result
         ])
 
-def get_price():
-    r = requests.get(
-        "https://api.metals.dev/v1/latest",
-        params={"api_key": METALS_API_KEY, "symbols": "XAU"}
-    )
-    return float(r.json()["rates"]["XAU"])
-
 def get_candles(limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
@@ -81,7 +74,8 @@ def get_candles(limit=200):
             "interval": INTERVAL,
             "outputsize": limit,
             "apikey": TD_API_KEY
-        }
+        },
+        timeout=10
     )
     data = r.json().get("values", [])
     data.reverse()
@@ -140,6 +134,7 @@ def analyze_market():
     confidence = 0
     direction = None
 
+    # RSI
     if r <= RSI_BUY:
         confidence += 25
         direction = "BUY"
@@ -149,6 +144,7 @@ def analyze_market():
     else:
         reasons.append(f"RSI ({r:.2f}) حيادي")
 
+    # EMA
     if price > e20 and price > e50:
         confidence += 20
         direction = "BUY"
@@ -158,11 +154,13 @@ def analyze_market():
     else:
         reasons.append("السعر بين EMA20 و EMA50")
 
+    # ATR
     if a >= MIN_ATR:
         confidence += 15
     else:
         reasons.append(f"ATR ضعيف ({a:.2f})")
 
+    # BREAKOUT
     recent_high = max(highs[-BREAKOUT_LOOKBACK:])
     recent_low = min(lows[-BREAKOUT_LOOKBACK:])
 
@@ -178,6 +176,7 @@ def analyze_market():
     else:
         reasons.append("لا يوجد Breakout")
 
+    # NEAR TRADE
     if NEAR_CONFIDENCE <= confidence < MIN_CONFIDENCE:
         return {
             "near": True,
@@ -199,7 +198,7 @@ def analyze_market():
     }
 
 # =========================
-# AUTO LOOP (NON-BLOCKING)
+# AUTO LOOP
 # =========================
 def auto_loop():
     global OPEN_TRADE
@@ -257,7 +256,7 @@ Breakout: {'نعم' if result['breakout'] else 'قريب'}
         except Exception as e:
             print("ERROR:", e)
 
-        # ✅ NON-BLOCKING WAIT
+        # NON BLOCKING WAIT
         for _ in range(CHECK_EVERY):
             time.sleep(1)
 
@@ -274,7 +273,7 @@ def start(message):
 
 @bot.message_handler(commands=["force"])
 def force_trade(message):
-    price = get_price()
+    price = 2400.0  # سعر وهمي للاختبار فقط
     atr_val = 5.0
 
     tp = price - atr_val * 2.5
@@ -299,5 +298,5 @@ XAUUSD – M15
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED – M15 (STABLE MODE)")
+print("🤖 BOT STARTED – M15 (FINAL STABLE MODE)")
 bot.infinity_polling()
