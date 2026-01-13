@@ -3,6 +3,7 @@ import time
 import requests
 import telebot
 from threading import Thread
+from datetime import datetime
 
 # =========================
 # Environment Variables
@@ -12,7 +13,7 @@ METALS_API_KEY = os.getenv("METALS_API_KEY")
 TD_API_KEY = os.getenv("TD_API_KEY")
 
 if not BOT_TOKEN or not METALS_API_KEY or not TD_API_KEY:
-    raise Exception("❌ تأكد من BOT_TOKEN و METALS_API_KEY و TD_API_KEY")
+    raise Exception("❌ تأكد من جميع Environment Variables")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -20,7 +21,28 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Global State
 # =========================
 LAST_SIGNAL = None
-SUBSCRIBERS = set()  # chat_ids
+SUBSCRIBERS = set()
+NEWS_ALERT_SENT = False
+
+# =========================
+# News Time Filter (UTC)
+# =========================
+def is_news_time():
+    now = datetime.utcnow().time()
+
+    # أخبار قوية + افتتاح نيويورك
+    blocked_times = [
+        ("12:15", "13:45"),
+        ("13:20", "14:00"),
+    ]
+
+    for start, end in blocked_times:
+        start_t = datetime.strptime(start, "%H:%M").time()
+        end_t = datetime.strptime(end, "%H:%M").time()
+        if start_t <= now <= end_t:
+            return True
+
+    return False
 
 # =========================
 # Price - Metals API
@@ -33,8 +55,7 @@ def get_xauusd_price():
         "symbols": "XAU"
     }
     r = requests.get(url, params=params, timeout=10)
-    data = r.json()
-    return round(1 / data["rates"]["XAU"], 2)
+    return round(1 / r.json()["rates"]["XAU"], 2)
 
 # =========================
 # Closes - TwelveData
@@ -49,8 +70,7 @@ def get_closes(limit=120):
     }
     r = requests.get(url, params=params, timeout=10)
     data = r.json()
-    values = data.get("values", [])
-    closes = [float(v["close"]) for v in values]
+    closes = [float(v["close"]) for v in data["values"]]
     closes.reverse()
     return closes
 
@@ -89,56 +109,66 @@ def analyze_market():
     ema50 = calculate_ema(closes, 50)
 
     if rsi >= 70 and price < ema20 and price < ema50:
-        return {
-            "type": "SELL",
-            "text": f"""
+        return ("SELL", f"""
 📊 XAUUSD – M5
 🔴 SELL @ {price}
 
-RSI(14): {rsi}
+RSI: {rsi}
 EMA20: {ema20}
 EMA50: {ema50}
 
-🎯 TP: {round(price - 10, 2)}
-❌ SL: {round(price + 12, 2)}
+🎯 TP: {price - 10}
+❌ SL: {price + 12}
 Confidence: 78%
-"""
-        }
+""")
 
     if rsi <= 30 and price > ema20 and price > ema50:
-        return {
-            "type": "BUY",
-            "text": f"""
+        return ("BUY", f"""
 📊 XAUUSD – M5
 🟢 BUY @ {price}
 
-RSI(14): {rsi}
+RSI: {rsi}
 EMA20: {ema20}
 EMA50: {ema50}
 
-🎯 TP: {round(price + 10, 2)}
-❌ SL: {round(price - 12, 2)}
+🎯 TP: {price + 10}
+❌ SL: {price - 12}
 Confidence: 78%
-"""
-        }
+""")
 
-    return {"type": "NO_TRADE"}
+    return ("NO_TRADE", None)
 
 # =========================
-# Auto Signal Loop (5 min)
+# Auto Loop
 # =========================
 def auto_signal_loop():
-    global LAST_SIGNAL
+    global LAST_SIGNAL, NEWS_ALERT_SENT
+
     while True:
         try:
-            signal = analyze_market()
-            if signal["type"] != "NO_TRADE" and signal["type"] != LAST_SIGNAL:
+            if is_news_time():
+                if not NEWS_ALERT_SENT:
+                    for chat_id in SUBSCRIBERS:
+                        bot.send_message(
+                            chat_id,
+                            "⛔ التداول متوقف مؤقتًا بسبب أخبار قوية\n⏳ ننتظر هدوء السوق"
+                        )
+                    NEWS_ALERT_SENT = True
+                time.sleep(300)
+                continue
+            else:
+                NEWS_ALERT_SENT = False
+
+            signal, text = analyze_market()
+            if signal not in ("NO_TRADE", LAST_SIGNAL):
                 for chat_id in SUBSCRIBERS:
-                    bot.send_message(chat_id, signal["text"])
-                LAST_SIGNAL = signal["type"]
+                    bot.send_message(chat_id, text)
+                LAST_SIGNAL = signal
+
         except Exception:
             pass
-        time.sleep(300)  # 5 دقائق
+
+        time.sleep(300)
 
 # =========================
 # Commands
@@ -148,24 +178,14 @@ def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 تم تفعيل الإشارات التلقائية كل 5 دقائق\n"
-        "سيتم إرسال الإشارة عند ظهور فرصة حقيقية فقط ✅"
+        "🤖 تم تفعيل الإشارات التلقائية\n"
+        "📰 فلترة الأخبار مفعّلة\n"
+        "⏱️ فحص كل 5 دقائق"
     )
-
-@bot.message_handler(commands=["signal"])
-def manual_signal(message):
-    try:
-        signal = analyze_market()
-        if signal["type"] == "NO_TRADE":
-            bot.send_message(message.chat.id, "⏸️ لا توجد فرصة الآن")
-        else:
-            bot.send_message(message.chat.id, signal["text"])
-    except Exception:
-        bot.send_message(message.chat.id, "⚠️ خطأ مؤقت")
 
 # =========================
 # Run
 # =========================
 Thread(target=auto_signal_loop).start()
-print("🤖 Bot running with AUTO signals every 5 minutes")
+print("🤖 Bot running with NEWS FILTER")
 bot.polling(none_stop=True)
