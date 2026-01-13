@@ -15,14 +15,17 @@ PAIR = "XAUUSD"
 INTERVAL = "15min"
 CHECK_EVERY = 900  # 15 minutes
 
-# Smart conditions
+# ===== STRATEGY TUNING =====
+RSI_BUY = 40       # مخفف
+RSI_SELL = 60      # مخفف
 MIN_CONFIDENCE = 60
-RSI_BUY = 35
-RSI_SELL = 65
-MIN_ATR = 1.5
+NEAR_CONFIDENCE = 45
 
-BREAKOUT_LOOKBACK = 20   # عدد الشموع
-BREAKOUT_BUFFER = 0.2   # هامش كسر (للذهب)
+BREAKOUT_LOOKBACK = 20
+BREAKOUT_BUFFER = 0.2
+BREAKOUT_WEIGHT = 30   # مرفوع
+
+MIN_ATR = 1.5
 
 # =========================
 # ENV VARIABLES
@@ -136,51 +139,66 @@ def analyze_market():
     a = atr(highs, lows, closes)
 
     confidence = 0
-    trend = None
+    direction = None
 
-    # RSI
-    if r <= RSI_BUY or r >= RSI_SELL:
-        confidence += 30
+    # ===== RSI =====
+    if r <= RSI_BUY:
+        confidence += 25
+        direction = "BUY"
+    elif r >= RSI_SELL:
+        confidence += 25
+        direction = "SELL"
     else:
-        reasons.append(f"RSI حيادي ({r:.2f})")
+        reasons.append(f"RSI ({r:.2f}) حيادي")
 
-    # EMA trend
+    # ===== EMA TREND =====
     if price > e20 and price > e50:
-        trend = "BUY"
-        confidence += 25
+        confidence += 20
+        direction = "BUY"
     elif price < e20 and price < e50:
-        trend = "SELL"
-        confidence += 25
+        confidence += 20
+        direction = "SELL"
     else:
         reasons.append("السعر بين EMA20 و EMA50")
 
-    # ATR
+    # ===== ATR =====
     if a >= MIN_ATR:
-        confidence += 20
+        confidence += 15
     else:
         reasons.append(f"ATR ضعيف ({a:.2f})")
 
-    # ===== Breakout Filter =====
+    # ===== BREAKOUT FILTER =====
     recent_high = max(highs[-BREAKOUT_LOOKBACK:])
     recent_low = min(lows[-BREAKOUT_LOOKBACK:])
 
+    breakout = False
     if price > recent_high + BREAKOUT_BUFFER:
-        confidence += 20
-        trend = "BUY"
+        confidence += BREAKOUT_WEIGHT
+        direction = "BUY"
+        breakout = True
     elif price < recent_low - BREAKOUT_BUFFER:
-        confidence += 20
-        trend = "SELL"
+        confidence += BREAKOUT_WEIGHT
+        direction = "SELL"
+        breakout = True
     else:
-        reasons.append("لا يوجد كسر سعري (Breakout)")
+        reasons.append("لا يوجد Breakout")
 
-    if confidence < MIN_CONFIDENCE:
+    # ===== NEAR SIGNAL WARNING =====
+    if NEAR_CONFIDENCE <= confidence < MIN_CONFIDENCE:
+        return {
+            "near": True,
+            "price": price,
+            "rsi": r,
+            "confidence": confidence,
+            "breakout": breakout
+        }
+
+    if confidence < MIN_CONFIDENCE or not direction:
         reasons.append(f"Confidence منخفض ({confidence}%)")
-
-    if reasons and confidence < MIN_CONFIDENCE:
         return reasons
 
     return {
-        "direction": trend,
+        "direction": direction,
         "price": price,
         "atr": a,
         "confidence": confidence
@@ -193,11 +211,10 @@ def auto_loop():
     global OPEN_TRADE
     while True:
         try:
-            print("🔍 Checking market", datetime.utcnow())
-
             if OPEN_TRADE is None:
                 result = analyze_market()
 
+                # ===== DEBUG / NO TRADE =====
                 if isinstance(result, list):
                     if DEBUG:
                         for uid in SUBSCRIBERS:
@@ -206,6 +223,22 @@ def auto_loop():
                                 "🧪 DEBUG MODE\n" +
                                 "\n".join(f"❌ {r}" for r in result)
                             )
+
+                # ===== NEAR TRADE =====
+                elif isinstance(result, dict) and result.get("near"):
+                    for uid in SUBSCRIBERS:
+                        bot.send_message(
+                            uid,
+                            f"""
+⚠️ قرب صفقة – XAUUSD M15
+RSI: {result['rsi']:.2f}
+Confidence: {result['confidence']}%
+Breakout: {'نعم' if result['breakout'] else 'قريب'}
+👀 راقب الشمعة القادمة
+"""
+                        )
+
+                # ===== REAL TRADE =====
                 else:
                     direction = result["direction"]
                     price = result["price"]
@@ -243,13 +276,14 @@ def start(message):
     SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 Breakout Filter مفعل"
+        "🤖 البوت يعمل\n⏱️ فريم M15\n🧪 DEBUG + Breakout Filter مفعل"
     )
 
 @bot.message_handler(commands=["force"])
 def force_trade(message):
     price = get_price()
     atr_val = 5.0
+
     tp = price - atr_val * 2.5
     sl = price + atr_val * 1.5
 
@@ -272,5 +306,5 @@ XAUUSD – M15
 # START
 # =========================
 Thread(target=auto_loop, daemon=True).start()
-print("🤖 BOT STARTED – M15 + BREAKOUT")
+print("🤖 BOT STARTED – M15 (SMART MODE)")
 bot.infinity_polling()
