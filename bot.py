@@ -1,6 +1,8 @@
 import os
+import time
 import requests
 import telebot
+from threading import Thread
 
 # =========================
 # Environment Variables
@@ -15,7 +17,13 @@ if not BOT_TOKEN or not METALS_API_KEY or not TD_API_KEY:
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # =========================
-# Get XAUUSD Price (LIVE) - Metals API
+# Global State
+# =========================
+LAST_SIGNAL = None
+SUBSCRIBERS = set()  # chat_ids
+
+# =========================
+# Price - Metals API
 # =========================
 def get_xauusd_price():
     url = "https://metals-api.com/api/latest"
@@ -26,11 +34,10 @@ def get_xauusd_price():
     }
     r = requests.get(url, params=params, timeout=10)
     data = r.json()
-    xau_rate = data["rates"]["XAU"]
-    return round(1 / xau_rate, 2)
+    return round(1 / data["rates"]["XAU"], 2)
 
 # =========================
-# Get OHLC (Closes) - TwelveData
+# Closes - TwelveData
 # =========================
 def get_closes(limit=120):
     url = "https://api.twelvedata.com/time_series"
@@ -44,15 +51,13 @@ def get_closes(limit=120):
     data = r.json()
     values = data.get("values", [])
     closes = [float(v["close"]) for v in values]
-    closes.reverse()  # الأقدم → الأحدث
+    closes.reverse()
     return closes
 
 # =========================
 # Indicators
 # =========================
 def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
     gains, losses = [], []
     for i in range(1, period + 1):
         diff = closes[-i] - closes[-i - 1]
@@ -66,8 +71,6 @@ def calculate_rsi(closes, period=14):
     return round(100 - (100 / (1 + rs)), 2)
 
 def calculate_ema(closes, period):
-    if len(closes) < period:
-        return None
     k = 2 / (period + 1)
     ema = sum(closes[:period]) / period
     for price in closes[period:]:
@@ -75,79 +78,94 @@ def calculate_ema(closes, period):
     return round(ema, 2)
 
 # =========================
+# Signal Logic
+# =========================
+def analyze_market():
+    price = get_xauusd_price()
+    closes = get_closes()
+
+    rsi = calculate_rsi(closes)
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+
+    if rsi >= 70 and price < ema20 and price < ema50:
+        return {
+            "type": "SELL",
+            "text": f"""
+📊 XAUUSD – M5
+🔴 SELL @ {price}
+
+RSI(14): {rsi}
+EMA20: {ema20}
+EMA50: {ema50}
+
+🎯 TP: {round(price - 10, 2)}
+❌ SL: {round(price + 12, 2)}
+Confidence: 78%
+"""
+        }
+
+    if rsi <= 30 and price > ema20 and price > ema50:
+        return {
+            "type": "BUY",
+            "text": f"""
+📊 XAUUSD – M5
+🟢 BUY @ {price}
+
+RSI(14): {rsi}
+EMA20: {ema20}
+EMA50: {ema50}
+
+🎯 TP: {round(price + 10, 2)}
+❌ SL: {round(price - 12, 2)}
+Confidence: 78%
+"""
+        }
+
+    return {"type": "NO_TRADE"}
+
+# =========================
+# Auto Signal Loop (5 min)
+# =========================
+def auto_signal_loop():
+    global LAST_SIGNAL
+    while True:
+        try:
+            signal = analyze_market()
+            if signal["type"] != "NO_TRADE" and signal["type"] != LAST_SIGNAL:
+                for chat_id in SUBSCRIBERS:
+                    bot.send_message(chat_id, signal["text"])
+                LAST_SIGNAL = signal["type"]
+        except Exception:
+            pass
+        time.sleep(300)  # 5 دقائق
+
+# =========================
 # Commands
 # =========================
 @bot.message_handler(commands=["start"])
 def start(message):
+    SUBSCRIBERS.add(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "🤖 بوت XAUUSD يعمل 24/7\n\n"
-        "الأوامر:\n"
-        "/signal ➜ إشارة RSI + EMA20/50 على M5"
+        "🤖 تم تفعيل الإشارات التلقائية كل 5 دقائق\n"
+        "سيتم إرسال الإشارة عند ظهور فرصة حقيقية فقط ✅"
     )
 
 @bot.message_handler(commands=["signal"])
-def signal(message):
+def manual_signal(message):
     try:
-        price = get_xauusd_price()
-        closes = get_closes()
-
-        rsi = calculate_rsi(closes, 14)
-        ema20 = calculate_ema(closes, 20)
-        ema50 = calculate_ema(closes, 50)
-
-        if None in (rsi, ema20, ema50):
-            bot.send_message(message.chat.id, "⚠️ بيانات غير كافية")
-            return
-
-        # منطق القرار
-        if rsi >= 70 and price < ema20 and price < ema50:
-            direction = "🔴 SELL"
-            tp = round(price - 10, 2)
-            sl = round(price + 12, 2)
-            conf = 78
-        elif rsi <= 30 and price > ema20 and price > ema50:
-            direction = "🟢 BUY"
-            tp = round(price + 10, 2)
-            sl = round(price - 12, 2)
-            conf = 78
+        signal = analyze_market()
+        if signal["type"] == "NO_TRADE":
+            bot.send_message(message.chat.id, "⏸️ لا توجد فرصة الآن")
         else:
-            bot.send_message(
-                message.chat.id,
-                f"""
-📊 XAUUSD – M5
-⏸️ NO TRADE
-
-RSI(14): {rsi}
-EMA20: {ema20}
-EMA50: {ema50}
-
-السوق محايد — ننتظر
-"""
-            )
-            return
-
-        bot.send_message(
-            message.chat.id,
-            f"""
-📊 XAUUSD – M5
-{direction} @ {price}
-
-RSI(14): {rsi}
-EMA20: {ema20}
-EMA50: {ema50}
-
-🎯 TP: {tp}
-❌ SL: {sl}
-Confidence: {conf}%
-"""
-        )
-
+            bot.send_message(message.chat.id, signal["text"])
     except Exception:
-        bot.send_message(message.chat.id, "⚠️ حدث خطأ، حاول لاحقًا")
+        bot.send_message(message.chat.id, "⚠️ خطأ مؤقت")
 
 # =========================
 # Run
 # =========================
-print("🤖 Bot running with RSI + EMA20/50")
+Thread(target=auto_signal_loop).start()
+print("🤖 Bot running with AUTO signals every 5 minutes")
 bot.polling(none_stop=True)
