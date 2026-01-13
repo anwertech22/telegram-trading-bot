@@ -1,7 +1,6 @@
 import os
 import requests
 import telebot
-import math
 
 # =========================
 # Environment Variables
@@ -31,9 +30,9 @@ def get_xauusd_price():
     return round(1 / xau_rate, 2)
 
 # =========================
-# Get OHLC for RSI - TwelveData
+# Get OHLC (Closes) - TwelveData
 # =========================
-def get_closes_for_rsi(limit=50):
+def get_closes(limit=120):
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": "XAU/USD",
@@ -49,26 +48,31 @@ def get_closes_for_rsi(limit=50):
     return closes
 
 # =========================
-# RSI Calculation
+# Indicators
 # =========================
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
-
     gains, losses = [], []
     for i in range(1, period + 1):
-        change = closes[-i] - closes[-i - 1]
-        if change >= 0:
-            gains.append(change)
+        diff = closes[-i] - closes[-i - 1]
+        if diff >= 0:
+            gains.append(diff)
         else:
-            losses.append(abs(change))
-
+            losses.append(abs(diff))
     avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period if losses else 0.0001
-
+    avg_loss = (sum(losses) / period) if losses else 0.0001
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    return round(100 - (100 / (1 + rs)), 2)
+
+def calculate_ema(closes, period):
+    if len(closes) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
 
 # =========================
 # Commands
@@ -79,31 +83,34 @@ def start(message):
         message.chat.id,
         "🤖 بوت XAUUSD يعمل 24/7\n\n"
         "الأوامر:\n"
-        "/signal ➜ إشارة RSI على M5"
+        "/signal ➜ إشارة RSI + EMA20/50 على M5"
     )
 
 @bot.message_handler(commands=["signal"])
 def signal(message):
     try:
         price = get_xauusd_price()
-        closes = get_closes_for_rsi()
-        rsi = calculate_rsi(closes)
+        closes = get_closes()
 
-        if rsi is None:
-            bot.send_message(message.chat.id, "⚠️ بيانات غير كافية لحساب RSI")
+        rsi = calculate_rsi(closes, 14)
+        ema20 = calculate_ema(closes, 20)
+        ema50 = calculate_ema(closes, 50)
+
+        if None in (rsi, ema20, ema50):
+            bot.send_message(message.chat.id, "⚠️ بيانات غير كافية")
             return
 
-        # قرار التداول
-        if rsi >= 70:
+        # منطق القرار
+        if rsi >= 70 and price < ema20 and price < ema50:
             direction = "🔴 SELL"
             tp = round(price - 10, 2)
             sl = round(price + 12, 2)
-            conf = 72
-        elif rsi <= 30:
+            conf = 78
+        elif rsi <= 30 and price > ema20 and price > ema50:
             direction = "🟢 BUY"
             tp = round(price + 10, 2)
             sl = round(price - 12, 2)
-            conf = 72
+            conf = 78
         else:
             bot.send_message(
                 message.chat.id,
@@ -112,6 +119,9 @@ def signal(message):
 ⏸️ NO TRADE
 
 RSI(14): {rsi}
+EMA20: {ema20}
+EMA50: {ema50}
+
 السوق محايد — ننتظر
 """
             )
@@ -124,6 +134,8 @@ RSI(14): {rsi}
 {direction} @ {price}
 
 RSI(14): {rsi}
+EMA20: {ema20}
+EMA50: {ema50}
 
 🎯 TP: {tp}
 ❌ SL: {sl}
@@ -135,7 +147,7 @@ Confidence: {conf}%
         bot.send_message(message.chat.id, "⚠️ حدث خطأ، حاول لاحقًا")
 
 # =========================
-# Run Bot
+# Run
 # =========================
-print("🤖 Bot is running with RSI...")
+print("🤖 Bot running with RSI + EMA20/50")
 bot.polling(none_stop=True)
