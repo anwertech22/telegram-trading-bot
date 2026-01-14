@@ -2,44 +2,68 @@ import os, time, requests, telebot
 from datetime import datetime, timedelta
 from threading import Thread
 
-# =========================
+# ==================================================
 # TIMEZONE (ALGERIA UTC+1)
-# =========================
+# ==================================================
 def dz_now():
     return datetime.utcnow() + timedelta(hours=1)
 
-# =========================
-# CONFIG
-# =========================
+# ==================================================
+# BASIC CONFIG
+# ==================================================
 PAIR = "XAU/USD"
 LOT_SIZE = 0.02
 
-ICT_INTERVAL = "15min"
-FAST_INTERVAL = "5min"
+TF_ICT = "15min"
+TF_FAST = "5min"
 
-CHECK_EVERY = 300  # 5 min
+CHECK_EVERY = 300  # 5 minutes
 
-# === RSI (مخفف) ===
-RSI_BUY = 35
-RSI_SELL = 65
+# ==================================================
+# INDICATORS SETTINGS
+# ==================================================
+EMA_PERIOD = 20
 
-# === CONFIDENCE ===
-TRADE_CONF = 60
-NEAR_MIN = 50
-NEAR_MAX = 59
+RSI_BUY = 40
+RSI_SELL = 60
 
-# === ATR TP/SL ===
-TP_FAST_ATR = 0.6
-SL_FAST_ATR = 0.8
+CONF_TRADE = 60
+CONF_NEAR_MIN = 50
+CONF_NEAR_MAX = 59
+
+# ATR TP/SL
 TP_ICT_ATR = 1.5
 SL_ICT_ATR = 1.0
 
-# === DIRECTION FILTER ===
-DIRECTION_COOLDOWN = 60  # minutes
+TP_EMA_ATR = 0.7
+SL_EMA_ATR = 0.9
 
-# =========================
+TP_SCALP_ATR = 0.4
+SL_SCALP_ATR = 0.6
+
+# ==================================================
+# PROTECTION
+# ==================================================
+DIRECTION_COOLDOWN = 60  # minutes
+MAX_SCALP_TRADES = 1
+
+# ==================================================
+# NEWS (ALGERIA TIME)
+# ==================================================
+NEWS_EVENTS = {
+    "CPI": ["14:30"],
+    "NFP": ["14:30"],
+    "FOMC": ["20:00"]
+}
+
+NEWS_BLOCK_BEFORE = 45  # minutes
+NEWS_BLOCK_AFTER = 15   # minutes
+POST_NEWS_WINDOW = 90   # minutes
+POST_NEWS_LIMIT = 2
+
+# ==================================================
 # ENV
-# =========================
+# ==================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TD_API_KEY = os.getenv("TD_API_KEY")
 if not BOT_TOKEN or not TD_API_KEY:
@@ -48,16 +72,23 @@ if not BOT_TOKEN or not TD_API_KEY:
 bot = telebot.TeleBot(BOT_TOKEN)
 SUBSCRIBERS = set()
 
-# =========================
+# ==================================================
 # STATE
-# =========================
+# ==================================================
 LAST_TRADE_DIR = None
 LAST_TRADE_TIME = None
+
 LAST_NEAR_ALERT = None
 
-# =========================
+LAST_NEWS_TIME = None
+POST_NEWS_ACTIVE = False
+POST_NEWS_COUNT = 0
+
+SCALP_COUNT = 0
+
+# ==================================================
 # DATA
-# =========================
+# ==================================================
 def get_candles(interval, limit=200):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
@@ -71,7 +102,7 @@ def get_candles(interval, limit=200):
     data.reverse()
     return data
 
-def ema(vals, p=20):
+def ema(vals, p=EMA_PERIOD):
     k = 2/(p+1)
     e = sum(vals[:p])/p
     for v in vals[p:]:
@@ -93,12 +124,12 @@ def atr(h,l,c,p=14):
         tr.append(max(h[-i]-l[-i],abs(h[-i]-c[-i-1]),abs(l[-i]-c[-i-1])))
     return sum(tr)/p
 
-# =========================
+# ==================================================
 # HELPERS
-# =========================
+# ==================================================
 def in_killzone():
     h = dz_now().hour
-    return (9<=h<=11) or (15<=h<=18)
+    return (9 <= h <= 11) or (15 <= h <= 18)
 
 def direction_allowed(direction):
     global LAST_TRADE_DIR, LAST_TRADE_TIME
@@ -109,28 +140,65 @@ def direction_allowed(direction):
     mins = (dz_now()-LAST_TRADE_TIME).total_seconds()/60
     return mins >= DIRECTION_COOLDOWN
 
-def send_near(price, score, direction, tf):
+def send_near(price, score, direction, tf, label):
     global LAST_NEAR_ALERT
     if LAST_NEAR_ALERT == score:
         return
     LAST_NEAR_ALERT = score
-    zone=f"{round(price-2,2)} – {round(price+2,2)}"
-    msg=f"""
-🚨 Near Trade Alert – XAUUSD ({tf})
+
+    zone = f"{round(price-2,2)} – {round(price+2,2)}"
+    msg = f"""
+🚨 Near Trade Alert – {label}
+📊 XAUUSD ({tf})
 📍 المنطقة: {zone}
-📊 الاتجاه: {direction}
+📈 الاتجاه: {direction}
 ⏳ قربنا من صفقة: {score}%
-⚠️ تحضير فقط – لا دخول بعد
+⚠️ تنبيه فقط – لا دخول بعد
 """
     for u in SUBSCRIBERS:
-        bot.send_message(u,msg)
+        bot.send_message(u, msg)
 
-# =========================
-# ANALYSIS CORE
-# =========================
-def analyze(interval, label):
-    cs=get_candles(interval)
-    if len(cs)<50:
+# ==================================================
+# NEWS ENGINE
+# ==================================================
+def news_blocked():
+    now = dz_now()
+    for times in NEWS_EVENTS.values():
+        for t in times:
+            h,m = map(int,t.split(":"))
+            nt = now.replace(hour=h,minute=m,second=0)
+            diff = abs((nt-now).total_seconds()/60)
+            if diff <= NEWS_BLOCK_BEFORE:
+                return True
+    return False
+
+def check_news():
+    global LAST_NEWS_TIME, POST_NEWS_ACTIVE, POST_NEWS_COUNT
+
+    now = dz_now()
+    now_str = now.strftime("%H:%M")
+
+    for name,times in NEWS_EVENTS.items():
+        if now_str in times:
+            LAST_NEWS_TIME = now
+            POST_NEWS_ACTIVE = False
+            POST_NEWS_COUNT = 0
+            for u in SUBSCRIBERS:
+                bot.send_message(u,f"📰 {name} صدر الآن\n⏸️ ننتظر هدوء السوق")
+
+    if LAST_NEWS_TIME:
+        mins = (now-LAST_NEWS_TIME).total_seconds()/60
+        if mins >= NEWS_BLOCK_AFTER:
+            POST_NEWS_ACTIVE = True
+        if mins >= POST_NEWS_WINDOW:
+            POST_NEWS_ACTIVE = False
+
+# ==================================================
+# STRATEGIES
+# ==================================================
+def analyze(tf, mode):
+    cs = get_candles(tf)
+    if len(cs) < 60:
         return None
 
     c=[float(x["close"]) for x in cs]
@@ -145,83 +213,117 @@ def analyze(interval, label):
     score=0
     direction=None
 
-    if in_killzone(): score+=20
     if price>e20:
-        direction="BUY"; score+=20
+        direction="BUY"; score+=30
     elif price<e20:
-        direction="SELL"; score+=20
+        direction="SELL"; score+=30
     else:
         return None
 
     if r<=RSI_BUY or r>=RSI_SELL:
         score+=20
 
-    if abs(c[-1]-c[-2])>a*0.25:
-        score+=10
+    if abs(c[-1]-c[-2]) > a*0.3:
+        score+=20
 
     # Near Trade
-    if NEAR_MIN<=score<TRADE_CONF:
-        send_near(price,score,direction,interval)
+    if CONF_NEAR_MIN <= score <= CONF_NEAR_MAX:
+        send_near(price, score, direction, tf, mode)
         return None
 
-    if score>=TRADE_CONF and direction_allowed(direction):
-        tp = price + a*(TP_ICT_ATR if interval==ICT_INTERVAL else TP_FAST_ATR) if direction=="BUY" else price - a*(TP_ICT_ATR if interval==ICT_INTERVAL else TP_FAST_ATR)
-        sl = price - a*(SL_ICT_ATR if interval==ICT_INTERVAL else SL_FAST_ATR) if direction=="BUY" else price + a*(SL_ICT_ATR if interval==ICT_INTERVAL else SL_FAST_ATR)
-        return label,direction,price,tp,sl,score
+    if score < CONF_TRADE:
+        return None
 
-    return None
+    tp_mult, sl_mult = (
+        (TP_ICT_ATR, SL_ICT_ATR) if mode=="🟢 صفقة قوية (ICT)" else
+        (TP_EMA_ATR, SL_EMA_ATR) if mode=="🟡 صفقة متوسطة (EMA)" else
+        (TP_SCALP_ATR, SL_SCALP_ATR)
+    )
 
-# =========================
+    tp = price + a*tp_mult if direction=="BUY" else price - a*tp_mult
+    sl = price - a*sl_mult if direction=="BUY" else price + a*sl_mult
+
+    return mode, direction, price, tp, sl, score
+
+# ==================================================
 # MAIN LOOP
-# =========================
+# ==================================================
 def loop():
-    global LAST_TRADE_DIR,LAST_TRADE_TIME
+    global LAST_TRADE_DIR, LAST_TRADE_TIME, POST_NEWS_COUNT, SCALP_COUNT
+
     while True:
         try:
-            checks=[
-                (ICT_INTERVAL,"🟢 صفقة قوية (ICT – M15)"),
-                (FAST_INTERVAL,"🟡 صفقة متوسطة (EMA – M5)"),
-                (FAST_INTERVAL,"🔴 صفقة مخاطرة عالية (Scalping – M5)")
+            check_news()
+
+            if news_blocked():
+                time.sleep(CHECK_EVERY)
+                continue
+
+            strategies = [
+                (TF_ICT, "🟢 صفقة قوية (ICT)"),
+                (TF_FAST, "🟡 صفقة متوسطة (EMA)")
             ]
-            for tf,label in checks:
-                res=analyze(tf,label)
+
+            if in_killzone() and SCALP_COUNT < MAX_SCALP_TRADES:
+                strategies.append((TF_FAST, "🔴 مخاطرة عالية (Scalp)"))
+
+            for tf,label in strategies:
+                res = analyze(tf,label)
                 if res:
-                    title,dir,price,tp,sl,conf=res
+                    mode, direction, price, tp, sl, conf = res
+
+                    if not direction_allowed(direction):
+                        continue
+
+                    if POST_NEWS_ACTIVE:
+                        if POST_NEWS_COUNT >= POST_NEWS_LIMIT:
+                            continue
+                        POST_NEWS_COUNT += 1
+
+                    if "Scalp" in label:
+                        SCALP_COUNT += 1
+
                     for u in SUBSCRIBERS:
                         bot.send_message(
                             u,
-                            f"""{title}
-📊 XAUUSD
-{'🟢 BUY' if dir=='BUY' else '🔴 SELL'}
+f"""{mode}
+📊 XAUUSD ({tf})
+{'🟢 BUY' if direction=='BUY' else '🔴 SELL'}
 Lot: {LOT_SIZE}
 Entry: {price:.2f}
 TP: {tp:.2f}
 SL: {sl:.2f}
 🧠 Confidence: {conf}%"""
                         )
-                    LAST_TRADE_DIR=dir
-                    LAST_TRADE_TIME=dz_now()
+
+                    LAST_TRADE_DIR = direction
+                    LAST_TRADE_TIME = dz_now()
                     time.sleep(60)
+
         except Exception as e:
             print("ERROR:",e)
+
         time.sleep(CHECK_EVERY)
 
-# =========================
+# ==================================================
 # COMMAND
-# =========================
+# ==================================================
 @bot.message_handler(commands=["start"])
 def start(m):
     SUBSCRIBERS.add(m.chat.id)
     bot.send_message(
         m.chat.id,
-        "🤖 High Activity Mode ON\n"
-        "RSI 35/65 | EMA20 | Conf 60%\n"
+        "🤖 FINAL Multi-Strategy System\n"
+        "🟢 ICT | 🟡 EMA | 🔴 Scalping\n"
         "🚨 Near Trade مفعّل\n"
-        "⏱️ منع الاتجاه 60 دقيقة"
+        "📰 CPI / NFP / FOMC 🇩🇿\n"
+        "⛔ منع التداول وقت الخبر\n"
+        "🔥 Post-News Mode\n"
+        "🛡️ حماية كاملة"
     )
 
-# =========================
+# ==================================================
 # START
-# =========================
+# ==================================================
 Thread(target=loop,daemon=True).start()
 bot.infinity_polling()
