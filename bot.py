@@ -1,204 +1,243 @@
-# ==================================================
-# FINAL TELEGRAM TRADING BOT (RENDER + TELEBOT)
-# ==================================================
+# ======================================
+# FINAL BOT WITH AUTO STATISTICS ENGINE
+# ======================================
 
-import os
 import time
-import math
-import threading
 from datetime import datetime
-import telebot
+from collections import defaultdict
 
-# ==================================================
-# ENV
-# ==================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise Exception("❌ BOT_TOKEN not found in ENV")
+# ===============================
+# SETTINGS
+# ===============================
 
-bot = telebot.TeleBot(BOT_TOKEN)
-
-# ==================================================
-# CONFIG
-# ==================================================
 SYMBOL = "XAUUSD"
-TIMEZONE = "UTC+1 (Algeria)"
 
-CHECK_INTERVAL = 60  # seconds
-
-EMA_PERIOD = 20
 RSI_BUY = 35
 RSI_SELL = 65
 
-CONFIDENCE_MIN = 60
+EMA_PERIOD = 20
+
+BASE_CONFIDENCE = 60
+POST_DUMP_CONF_BOOST = 15
+ICT_PRIORITY_BOOST = 10
 
 ATR_MULTIPLIER = 1.8
 BODY_MULTIPLIER = 1.5
 
-# ==================================================
-# STATE
-# ==================================================
-SUBSCRIBERS = set()
+# ===============================
+# GLOBAL STATE
+# ===============================
+
+open_trades = []
+
+stats = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
+    "by_strategy": defaultdict(lambda: {"wins": 0, "losses": 0})
+}
+
 LIQUIDITY_DUMP_ACTIVE = False
 POST_DUMP_MODE = False
-last_signal_time = None
 
-# ==================================================
-# UTILITIES
-# ==================================================
-def log(msg):
-    print(f"[{datetime.utcnow()}] {msg}")
+# ===============================
+# INDICATORS (SIMPLIFIED)
+# ===============================
 
-# ==================================================
-# MOCK MARKET DATA (SAFE FOR RENDER)
-# ==================================================
-def get_market_data():
-    base = 4600
-    closes = [base + math.sin(i / 3) * 12 for i in range(50)]
-    highs = [c + 6 for c in closes]
-    lows = [c - 6 for c in closes]
-    return closes, highs, lows
-
-# ==================================================
-# INDICATORS
-# ==================================================
 def ema(values, period):
     k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
+    ema_vals = []
+    for i, v in enumerate(values):
+        ema_vals.append(v if i == 0 else v * k + ema_vals[-1] * (1 - k))
+    return ema_vals
 
-def rsi(values, period=14):
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        if diff >= 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
-    if len(gains) < period:
-        return None
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def atr(highs, lows, closes, period=14):
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
+def atr(candles):
+    tr = []
+    for i in range(1, len(candles)):
+        tr.append(max(
+            candles[i]['high'] - candles[i]['low'],
+            abs(candles[i]['high'] - candles[i-1]['close']),
+            abs(candles[i]['low'] - candles[i-1]['close'])
         ))
-    return sum(trs[-period:]) / period if len(trs) >= period else None
+    return sum(tr[-14:]) / 14
 
-# ==================================================
-# LIQUIDITY DUMP DETECTOR
-# ==================================================
-def detect_liquidity_dump(highs, lows, closes):
+# ===============================
+# CANDLE PATTERNS
+# ===============================
+
+def is_hammer(c):
+    body = abs(c['close'] - c['open'])
+    wick = min(c['open'], c['close']) - c['low']
+    return wick > body * 2
+
+def is_pinbar(c):
+    body = abs(c['close'] - c['open'])
+    full = c['high'] - c['low']
+    return body < full * 0.3
+
+# ===============================
+# LIQUIDITY DUMP
+# ===============================
+
+def detect_liquidity_dump(candles):
     global LIQUIDITY_DUMP_ACTIVE, POST_DUMP_MODE
 
-    current_atr = atr(highs, lows, closes)
-    avg_atr = atr(highs[:-1], lows[:-1], closes[:-1])
+    bodies = [abs(c['close'] - c['open']) for c in candles[-10:-1]]
+    avg_body = sum(bodies) / len(bodies)
+    last = candles[-1]
 
-    if not current_atr or not avg_atr:
-        return
+    body = abs(last['close'] - last['open'])
+    current_atr = atr(candles)
+    avg_atr = sum([atr(candles[:i]) for i in range(len(candles)-5, len(candles)-1)]) / 4
 
-    if current_atr > avg_atr * ATR_MULTIPLIER:
+    if body > avg_body * BODY_MULTIPLIER and current_atr > avg_atr * ATR_MULTIPLIER:
         LIQUIDITY_DUMP_ACTIVE = True
         POST_DUMP_MODE = True
-        log("🔥 Liquidity Dump Detected")
+        print("🧨 Liquidity Dump detected")
 
-# ==================================================
-# SIGNAL ENGINE
-# ==================================================
-def analyze_market():
-    global last_signal_time, LIQUIDITY_DUMP_ACTIVE, POST_DUMP_MODE
+# ===============================
+# POST DUMP REENTRY
+# ===============================
 
-    closes, highs, lows = get_market_data()
+def post_dump_reentry(candles, ema20):
+    global LIQUIDITY_DUMP_ACTIVE, POST_DUMP_MODE
 
-    detect_liquidity_dump(highs, lows, closes)
+    last = candles[-1]
+    reject = (is_hammer(last) or is_pinbar(last))
+    above_ema = last['close'] > ema20[-1]
 
-    ema20 = ema(closes, EMA_PERIOD)
-    rsi_val = rsi(closes)
-    price = closes[-1]
+    if POST_DUMP_MODE and reject and above_ema:
+        LIQUIDITY_DUMP_ACTIVE = False
+        POST_DUMP_MODE = False
+        return True
 
-    # Block during dump
-    if LIQUIDITY_DUMP_ACTIVE:
-        if price > ema20:
-            LIQUIDITY_DUMP_ACTIVE = False
-            POST_DUMP_MODE = False
-            log("✅ Post-Dump recovery confirmed")
-        else:
-            return
+    return False
 
-    direction = None
-    confidence = CONFIDENCE_MIN
+# ===============================
+# CONFIDENCE
+# ===============================
 
-    if price > ema20 and rsi_val and rsi_val <= RSI_BUY:
-        direction = "BUY"
-    elif price < ema20 and rsi_val and rsi_val >= RSI_SELL:
-        direction = "SELL"
+def calc_conf(strategy):
+    conf = BASE_CONFIDENCE
+    if POST_DUMP_MODE:
+        conf += POST_DUMP_CONF_BOOST
+    if strategy == "ICT" and POST_DUMP_MODE:
+        conf += ICT_PRIORITY_BOOST
+    return min(conf, 90)
 
-    if not direction:
+# ===============================
+# TRADE HANDLING
+# ===============================
+
+def open_trade(strategy, direction, price):
+    trade = {
+        "strategy": strategy,
+        "direction": direction,
+        "entry": price,
+        "tp": price + 10 if direction == "BUY" else price - 10,
+        "sl": price - 6 if direction == "BUY" else price + 6,
+        "time": datetime.now()
+    }
+    open_trades.append(trade)
+    print(f"📥 OPEN {strategy} {direction} @ {price}")
+
+def check_trades(price):
+    for trade in open_trades[:]:
+        hit_tp = trade["direction"] == "BUY" and price >= trade["tp"] or \
+                 trade["direction"] == "SELL" and price <= trade["tp"]
+
+        hit_sl = trade["direction"] == "BUY" and price <= trade["sl"] or \
+                 trade["direction"] == "SELL" and price >= trade["sl"]
+
+        if hit_tp or hit_sl:
+            stats["total"] += 1
+            if hit_tp:
+                stats["wins"] += 1
+                stats["by_strategy"][trade["strategy"]]["wins"] += 1
+                print(f"✅ WIN {trade['strategy']}")
+            else:
+                stats["losses"] += 1
+                stats["by_strategy"][trade["strategy"]]["losses"] += 1
+                print(f"❌ LOSS {trade['strategy']}")
+
+            open_trades.remove(trade)
+
+# ===============================
+# STATS REPORT
+# ===============================
+
+def print_stats():
+    if stats["total"] == 0:
+        print("📊 No trades yet")
         return
 
-    # Prevent spam
-    now = datetime.utcnow().minute
-    if last_signal_time == now:
-        return
-    last_signal_time = now
+    winrate = (stats["wins"] / stats["total"]) * 100
+    print("\n📊 PERFORMANCE REPORT")
+    print(f"Total Trades: {stats['total']}")
+    print(f"Wins: {stats['wins']}")
+    print(f"Losses: {stats['losses']}")
+    print(f"Win Rate: {winrate:.2f}%")
 
-    msg = (
-        f"📊 إشارة تداول\n"
-        f"{SYMBOL}\n"
-        f"الاتجاه: {direction}\n"
-        f"السعر: {price:.2f}\n"
-        f"🧠 Confidence: {confidence}%\n\n"
-        f"⏱ Timezone: {TIMEZONE}"
-    )
+    for strat, s in stats["by_strategy"].items():
+        total = s["wins"] + s["losses"]
+        if total > 0:
+            wr = (s["wins"] / total) * 100
+            print(f"- {strat}: {wr:.1f}%")
 
-    for uid in SUBSCRIBERS:
-        bot.send_message(uid, msg)
+# ===============================
+# MAIN LOOP (SIMULATION)
+# ===============================
 
-# ==================================================
-# BACKGROUND LOOP (RENDER SAFE)
-# ==================================================
-def market_loop():
-    log("🤖 Market engine started")
-    while True:
-        try:
-            analyze_market()
-        except Exception as e:
-            log(f"ERROR: {e}")
-        time.sleep(CHECK_INTERVAL)
+def on_new_candle(candles, rsi):
+    prices = [c['close'] for c in candles]
+    ema20 = ema(prices, EMA_PERIOD)
 
-# ==================================================
-# TELEGRAM COMMANDS
-# ==================================================
-@bot.message_handler(commands=["start"])
-def start(message):
-    SUBSCRIBERS.add(message.chat.id)
-    bot.send_message(
-        message.chat.id,
-        "🤖 البوت يعمل الآن بنجاح ✅\n\n"
-        "📊 XAUUSD\n"
-        "🧠 EMA20 + RSI\n"
-        "🔥 Liquidity Dump Protection\n"
-        "⏱ يعمل 24/7 على Render\n\n"
-        "سيتم إرسال الإشارات تلقائيًا عند توفر فرصة."
-    )
+    detect_liquidity_dump(candles)
 
-# ==================================================
-# START BOT (IMPORTANT)
-# ==================================================
-if __name__ == "__main__":
-    threading.Thread(target=market_loop, daemon=True).start()
-    log("📡 Telegram polling started")
-    bot.infinity_polling()
+    if post_dump_reentry(candles, ema20):
+        open_trade("ICT", "BUY", prices[-1])
+
+    if not LIQUIDITY_DUMP_ACTIVE:
+        if rsi <= RSI_BUY:
+            open_trade("Scalping", "BUY", prices[-1])
+        elif rsi >= RSI_SELL:
+            open_trade("Scalping", "SELL", prices[-1])
+
+    check_trades(prices[-1])
+
+# ======================================
+# END
+# ======================================
+# ===============================
+# SIMPLE RUN LOOP (FIX)
+# ===============================
+
+import random
+
+def mock_candles():
+    base = 4600 + random.uniform(-5, 5)
+    candles = []
+    for _ in range(30):
+        o = base + random.uniform(-3, 3)
+        c = o + random.uniform(-5, 5)
+        h = max(o, c) + random.uniform(0, 3)
+        l = min(o, c) - random.uniform(0, 3)
+        candles.append({
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c
+        })
+        base = c
+    return candles
+
+def mock_rsi():
+    return random.randint(20, 80)
+
+print("🤖 Bot started (simulation mode)")
+
+while True:
+    candles = mock_candles()
+    rsi_val = mock_rsi()
+    on_new_candle(candles, rsi_val)
+    time.sleep(5)
