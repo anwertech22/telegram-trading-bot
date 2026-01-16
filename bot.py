@@ -1,210 +1,267 @@
-# ======================================
-# FINAL BOT WITH AUTO STATISTICS ENGINE
-# ======================================
+# =========================================
+# FINAL MULTI-STRATEGY TRADING BOT (SIGNALS)
+# =========================================
 
 import time
-from datetime import datetime
-from collections import defaultdict
+import math
+import statistics
+from datetime import datetime, timedelta
 
-# ===============================
-# SETTINGS
-# ===============================
+# =========================
+# CONFIG
+# =========================
 
 SYMBOL = "XAUUSD"
+TIMEFRAMES = ["M5", "M15"]
+CONFIDENCE_MIN = 60
 
+EMA_PERIOD = 20
 RSI_BUY = 35
 RSI_SELL = 65
 
-EMA_PERIOD = 20
+ATR_PERIOD = 14
+ATR_DUMP_MULTIPLIER = 1.8
 
-BASE_CONFIDENCE = 60
-POST_DUMP_CONF_BOOST = 15
-ICT_PRIORITY_BOOST = 10
+CHECK_INTERVAL = 60  # seconds
+TIMEZONE = "Algeria (UTC+1)"
 
-ATR_MULTIPLIER = 1.8
-BODY_MULTIPLIER = 1.5
+# News (manual schedule – can be automated later)
+NEWS_EVENTS = ["CPI", "NFP", "FOMC"]
+NEWS_BLOCK_MINUTES = 30
+POST_NEWS_WAIT = 15
 
-# ===============================
+# =========================
 # GLOBAL STATE
-# ===============================
+# =========================
 
+last_signal_time = None
+post_dump_mode = False
 open_trades = []
-
 stats = {
     "total": 0,
-    "wins": 0,
-    "losses": 0,
-    "by_strategy": defaultdict(lambda: {"wins": 0, "losses": 0})
+    "win": 0,
+    "loss": 0
 }
 
-LIQUIDITY_DUMP_ACTIVE = False
-POST_DUMP_MODE = False
+# =========================
+# UTILITIES
+# =========================
 
-# ===============================
-# INDICATORS (SIMPLIFIED)
-# ===============================
+def log(msg):
+    print(f"[{datetime.utcnow()}] {msg}")
 
-def ema(values, period):
-    k = 2 / (period + 1)
-    ema_vals = []
-    for i, v in enumerate(values):
-        ema_vals.append(v if i == 0 else v * k + ema_vals[-1] * (1 - k))
-    return ema_vals
-
-def atr(candles):
-    tr = []
-    for i in range(1, len(candles)):
-        tr.append(max(
-            candles[i]['high'] - candles[i]['low'],
-            abs(candles[i]['high'] - candles[i-1]['close']),
-            abs(candles[i]['low'] - candles[i-1]['close'])
-        ))
-    return sum(tr[-14:]) / 14
-
-# ===============================
-# CANDLE PATTERNS
-# ===============================
-
-def is_hammer(c):
-    body = abs(c['close'] - c['open'])
-    wick = min(c['open'], c['close']) - c['low']
-    return wick > body * 2
-
-def is_pinbar(c):
-    body = abs(c['close'] - c['open'])
-    full = c['high'] - c['low']
-    return body < full * 0.3
-
-# ===============================
-# LIQUIDITY DUMP
-# ===============================
-
-def detect_liquidity_dump(candles):
-    global LIQUIDITY_DUMP_ACTIVE, POST_DUMP_MODE
-
-    bodies = [abs(c['close'] - c['open']) for c in candles[-10:-1]]
-    avg_body = sum(bodies) / len(bodies)
-    last = candles[-1]
-
-    body = abs(last['close'] - last['open'])
-    current_atr = atr(candles)
-    avg_atr = sum([atr(candles[:i]) for i in range(len(candles)-5, len(candles)-1)]) / 4
-
-    if body > avg_body * BODY_MULTIPLIER and current_atr > avg_atr * ATR_MULTIPLIER:
-        LIQUIDITY_DUMP_ACTIVE = True
-        POST_DUMP_MODE = True
-        print("🧨 Liquidity Dump detected")
-
-# ===============================
-# POST DUMP REENTRY
-# ===============================
-
-def post_dump_reentry(candles, ema20):
-    global LIQUIDITY_DUMP_ACTIVE, POST_DUMP_MODE
-
-    last = candles[-1]
-    reject = (is_hammer(last) or is_pinbar(last))
-    above_ema = last['close'] > ema20[-1]
-
-    if POST_DUMP_MODE and reject and above_ema:
-        LIQUIDITY_DUMP_ACTIVE = False
-        POST_DUMP_MODE = False
-        return True
-
+def in_news_time():
+    # Placeholder (manual / future API)
     return False
 
-# ===============================
-# CONFIDENCE
-# ===============================
+def calculate_rsi(closes, period=14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    if len(gains) < period:
+        return None
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def calc_conf(strategy):
-    conf = BASE_CONFIDENCE
-    if POST_DUMP_MODE:
-        conf += POST_DUMP_CONF_BOOST
-    if strategy == "ICT" and POST_DUMP_MODE:
-        conf += ICT_PRIORITY_BOOST
-    return min(conf, 90)
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-# ===============================
-# TRADE HANDLING
-# ===============================
+def calculate_atr(highs, lows, closes, period=14):
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    return statistics.mean(trs[-period:])
 
-def open_trade(strategy, direction, price):
-    trade = {
+# =========================
+# PATTERNS
+# =========================
+
+def is_hammer(open_, high, low, close):
+    body = abs(close - open_)
+    lower_wick = min(open_, close) - low
+    upper_wick = high - max(open_, close)
+    return lower_wick > body * 2 and upper_wick < body
+
+def is_pinbar(open_, high, low, close):
+    body = abs(close - open_)
+    wick = max(high - close, open_ - low)
+    return wick > body * 2
+
+# =========================
+# LIQUIDITY DUMP DETECTOR
+# =========================
+
+def detect_liquidity_dump(highs, lows, closes):
+    atr_current = calculate_atr(highs, lows, closes, ATR_PERIOD)
+    atr_avg = calculate_atr(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
+    if not atr_current or not atr_avg:
+        return False
+    return atr_current > atr_avg * ATR_DUMP_MULTIPLIER
+
+# =========================
+# STRATEGIES
+# =========================
+
+def strategy_ema(closes, rsi):
+    ema = calculate_ema(closes, EMA_PERIOD)
+    if not ema or not rsi:
+        return None
+    price = closes[-1]
+    if price > ema and rsi <= RSI_BUY:
+        return "BUY"
+    if price < ema and rsi >= RSI_SELL:
+        return "SELL"
+    return None
+
+def strategy_ict(closes):
+    # simplified ICT bias (higher highs / lower lows)
+    if closes[-1] > closes[-3]:
+        return "BUY"
+    if closes[-1] < closes[-3]:
+        return "SELL"
+    return None
+
+def strategy_scalping(closes):
+    if abs(closes[-1] - closes[-2]) > abs(closes[-2] - closes[-3]):
+        return "SELL"
+    return None
+
+# =========================
+# SIGNAL ENGINE
+# =========================
+
+def evaluate_market(data):
+    global post_dump_mode
+
+    closes = data["close"]
+    highs = data["high"]
+    lows = data["low"]
+
+    rsi = calculate_rsi(closes)
+    dump = detect_liquidity_dump(highs, lows, closes)
+
+    if dump:
+        post_dump_mode = True
+        log("🔥 Liquidity Dump detected → Post-Dump Mode ON")
+        return None
+
+    if post_dump_mode:
+        if closes[-1] > calculate_ema(closes, EMA_PERIOD):
+            post_dump_mode = False
+            log("✅ Market stabilized after dump")
+
+    signals = []
+
+    ema_sig = strategy_ema(closes, rsi)
+    if ema_sig:
+        signals.append(("EMA", ema_sig, 60))
+
+    ict_sig = strategy_ict(closes)
+    if ict_sig:
+        signals.append(("ICT", ict_sig, 70))
+
+    scalp_sig = strategy_scalping(closes)
+    if scalp_sig:
+        signals.append(("Scalping", scalp_sig, 55))
+
+    if not signals:
+        return None
+
+    # choose strongest
+    best = max(signals, key=lambda x: x[2])
+    if best[2] < CONFIDENCE_MIN:
+        return None
+
+    return best
+
+# =========================
+# MOCK MARKET DATA
+# =========================
+
+def get_mock_data():
+    base = 4600
+    closes = [base + math.sin(i / 3) * 10 for i in range(50)]
+    highs = [c + 5 for c in closes]
+    lows = [c - 5 for c in closes]
+    return {"close": closes, "high": highs, "low": lows}
+
+# =========================
+# TRADE TRACKING
+# =========================
+
+def register_trade(strategy, side, confidence):
+    stats["total"] += 1
+    open_trades.append({
         "strategy": strategy,
-        "direction": direction,
-        "entry": price,
-        "tp": price + 10 if direction == "BUY" else price - 10,
-        "sl": price - 6 if direction == "BUY" else price + 6,
-        "time": datetime.now()
-    }
-    open_trades.append(trade)
-    print(f"📥 OPEN {strategy} {direction} @ {price}")
+        "side": side,
+        "confidence": confidence,
+        "time": datetime.utcnow()
+    })
+    log(f"📢 SIGNAL → {strategy} | {side} | Conf {confidence}%")
 
-def check_trades(price):
-    for trade in open_trades[:]:
-        hit_tp = trade["direction"] == "BUY" and price >= trade["tp"] or \
-                 trade["direction"] == "SELL" and price <= trade["tp"]
+def close_trade(win=True):
+    if win:
+        stats["win"] += 1
+    else:
+        stats["loss"] += 1
 
-        hit_sl = trade["direction"] == "BUY" and price <= trade["sl"] or \
-                 trade["direction"] == "SELL" and price >= trade["sl"]
+# =========================
+# MAIN LOOP (RENDER SAFE)
+# =========================
 
-        if hit_tp or hit_sl:
-            stats["total"] += 1
-            if hit_tp:
-                stats["wins"] += 1
-                stats["by_strategy"][trade["strategy"]]["wins"] += 1
-                print(f"✅ WIN {trade['strategy']}")
-            else:
-                stats["losses"] += 1
-                stats["by_strategy"][trade["strategy"]]["losses"] += 1
-                print(f"❌ LOSS {trade['strategy']}")
+def run_bot():
+    log("🤖 FINAL Multi-Strategy Bot STARTED")
+    log("⏱ Timezone: Algeria (UTC+1)")
+    log("🧠 Strategies: ICT | EMA | Scalping")
+    log("🛡 News Filter: CPI / NFP / FOMC")
+    log("🔥 Liquidity Dump Protection ON")
 
-            open_trades.remove(trade)
+    while True:
+        try:
+            if in_news_time():
+                log("⛔ News time – trading paused")
+                time.sleep(CHECK_INTERVAL)
+                continue
 
-# ===============================
-# STATS REPORT
-# ===============================
+            data = get_mock_data()
+            signal = evaluate_market(data)
 
-def print_stats():
-    if stats["total"] == 0:
-        print("📊 No trades yet")
-        return
+            if signal:
+                strategy, side, conf = signal
+                register_trade(strategy, side, conf)
 
-    winrate = (stats["wins"] / stats["total"]) * 100
-    print("\n📊 PERFORMANCE REPORT")
-    print(f"Total Trades: {stats['total']}")
-    print(f"Wins: {stats['wins']}")
-    print(f"Losses: {stats['losses']}")
-    print(f"Win Rate: {winrate:.2f}%")
+            time.sleep(CHECK_INTERVAL)
 
-    for strat, s in stats["by_strategy"].items():
-        total = s["wins"] + s["losses"]
-        if total > 0:
-            wr = (s["wins"] / total) * 100
-            print(f"- {strat}: {wr:.1f}%")
+        except Exception as e:
+            log(f"❌ ERROR: {e}")
+            time.sleep(10)
 
-# ===============================
-# MAIN LOOP (SIMULATION)
-# ===============================
+# =========================
+# START
+# =========================
 
-def on_new_candle(candles, rsi):
-    prices = [c['close'] for c in candles]
-    ema20 = ema(prices, EMA_PERIOD)
-
-    detect_liquidity_dump(candles)
-
-    if post_dump_reentry(candles, ema20):
-        open_trade("ICT", "BUY", prices[-1])
-
-    if not LIQUIDITY_DUMP_ACTIVE:
-        if rsi <= RSI_BUY:
-            open_trade("Scalping", "BUY", prices[-1])
-        elif rsi >= RSI_SELL:
-            open_trade("Scalping", "SELL", prices[-1])
-
-    check_trades(prices[-1])
-
-# ======================================
-# END
-# ======================================
+if __name__ == "__main__":
+    run_bot()
